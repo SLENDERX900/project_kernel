@@ -1,20 +1,12 @@
 import argparse
 import os
 import re
-import sys
-import time
 from datetime import datetime
 from typing import Dict, Tuple
 
-# Add local packages to path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-local_packages = os.path.join(current_dir, 'packages')
-if os.path.exists(local_packages):
-    sys.path.insert(0, local_packages)
-
 import pandas as pd
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim as GeopyNominatim, ArcGIS, Photon
+from geopy.geocoders import Nominatim
 
 DEFAULT_TARGET_LAT = 3.1022
 DEFAULT_TARGET_LNG = 101.5333
@@ -188,116 +180,36 @@ def assign_neighbourhood(lat: float, lng: float, address: str) -> str:
 
 
 def validate_and_fill_coordinates(df: pd.DataFrame, centre_lat: float, centre_lng: float, radius_km: float) -> pd.DataFrame:
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "ProjectKestrelBot/1.0 (https://project-kestrel.example.com; research-data@example.com)"
-    ]
-
+    geolocator = Nominatim(user_agent="project-kestrel-enricher")
     geocoded = 0
     excluded = 0
-    failed_geocoding = 0
 
     keep_rows = []
-    total_rows = len(df)
-    print(f"Starting coordinate validation for {total_rows} rows...")
-    accepted_location_hints = ["shah alam", "selangor", "bukit jelutong", "setia alam", "elmina", "denai alam", "subang"]
-
-    arcgis = ArcGIS(user_agent="project-kestrel-enricher-v2")
-    photon = Photon(user_agent="project-kestrel-enricher-v2")
-
-    nominatim_blocked = False
-
-    for i, (_, row) in enumerate(df.iterrows()):
+    for _, row in df.iterrows():
         lat = row.get("lat")
         lng = row.get("lng")
 
-        if (pd.isna(lat) or pd.isna(lng)):
-            addr = str(row.get("address", "")).strip()
-            name = str(row.get("centre_name", "")).strip()
-
-            if not addr or addr.lower() in ["nan", "none"]:
-                if name and name.lower() not in ["nan", "none"]:
-                    query = f"{name} Shah Alam"
+        if (pd.isna(lat) or pd.isna(lng)) and str(row.get("address", "")).strip():
+            try:
+                loc = geolocator.geocode(str(row.get("address")))
+                if loc:
+                    lat, lng = float(loc.latitude), float(loc.longitude)
+                    geocoded += 1
+                    row["lat"], row["lng"] = lat, lng
                 else:
-                    query = None
-            else:
-                query = addr
-
-            if query and query.lower() not in ["nan", "none", "shah alam"]:
-                if i % 10 == 0:
-                    print(f"Geocoding progress: {i}/{total_rows}...")
-
-                success = False
-
-                try:
-                    time.sleep(1)
-                    loc = arcgis.geocode(query, timeout=10)
-                    if loc:
-                        lat, lng = float(loc.latitude), float(loc.longitude)
-                        geocoded += 1
-                        row["lat"], row["lng"] = lat, lng
-                        success = True
-                except Exception:
-                    pass
-
-                if not success:
-                    try:
-                        time.sleep(1)
-                        loc = photon.geocode(query, timeout=10)
-                        if loc:
-                            lat, lng = float(loc.latitude), float(loc.longitude)
-                            geocoded += 1
-                            row["lat"], row["lng"] = lat, lng
-                            success = True
-                    except Exception:
-                        pass
-
-                if not success and not nominatim_blocked:
-                    for ua in user_agents:
-                        geolocator = GeopyNominatim(user_agent=ua)
-                        try:
-                            time.sleep(2)
-                            loc = geolocator.geocode(query, timeout=10)
-                            if loc:
-                                lat, lng = float(loc.latitude), float(loc.longitude)
-                                geocoded += 1
-                                row["lat"], row["lng"] = lat, lng
-                                success = True
-                                break
-                        except Exception as e:
-                            if "429" in str(e):
-                                print("Nominatim rate limited (429). Waiting 30 seconds and disabling for this run...")
-                                nominatim_blocked = True
-                                time.sleep(30)
-                                break
-                            elif "403" in str(e):
-                                pass
-                            else:
-                                print(f"Nominatim error: {e}")
-
-                if not success:
-                    failed_geocoding += 1
-                    row["lat"], row["lng"] = None, None
                     row["source_notes"] = f"{row.get('source_notes', '')} | [Geocoding failed — verify manually]".strip(" |")
+            except Exception:
+                row["source_notes"] = f"{row.get('source_notes', '')} | [Geocoding failed — verify manually]".strip(" |")
 
         if pd.notna(lat) and pd.notna(lng):
-            if float(lat) < 1.0 or float(lat) > 7.5 or float(lng) < 99.5 or float(lng) > 119.5:
-                print(f"Excluded {row.get('centre_name', 'unknown')} — coordinates outside Malaysia bounding box")
-                excluded += 1
-                continue
             if geodesic((centre_lat, centre_lng), (float(lat), float(lng))).km > radius_km:
-                excluded += 1
-                continue
-        else:
-            address_text = str(row.get("address", "")).lower()
-            if not any(hint in address_text for hint in accepted_location_hints):
                 excluded += 1
                 continue
 
         keep_rows.append(row)
 
     result = pd.DataFrame(keep_rows)
-    print(f"Coordinate validation: {len(result)} rows within radius. {excluded} excluded. {geocoded} geocoded. {failed_geocoding} failed.")
+    print(f"Coordinate validation: {len(result)} rows within radius. {excluded} excluded. {geocoded} geocoded.")
     return result
 
 
@@ -442,27 +354,18 @@ def enrich(input_csv: str, output_csv: str, centre_lat: float, centre_lng: float
     df_enriched["scale"] = df_enriched["scale"].apply(lambda x: normalize_text_cell(x, "Independent"))
     df_enriched["religious_orientation"] = df_enriched["religious_orientation"].apply(lambda x: normalize_text_cell(x, "Secular"))
 
-    REQUIRED_COLUMNS_CHECK = ["centre_name", "address", "lat", "lng"]
-    for col in REQUIRED_COLUMNS_CHECK:
-        if col not in df_enriched.columns:
-            print(f"Warning: Column '{col}' is missing from the final data!")
-            continue
-        blank_count = df_enriched[df_enriched[col].astype(str).str.strip().isin(["", "nan", "None"])].shape[0]
-        if blank_count > 0:
-            print(f"Warning: Column '{col}' still has {blank_count} blank entries.")
-        else:
-            print(f"Check passed: Column '{col}' has no blank entries.")
+    blank_count = int(df_enriched[REQUIRED_COLUMNS].isna().sum().sum())
+    blank_count += int((df_enriched[REQUIRED_COLUMNS].astype(str).apply(lambda s: s.str.strip()) == "").sum().sum())
+    assert blank_count == 0, f"Blank cell check failed: {blank_count}"
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df_enriched.to_csv(output_csv, index=False)
     print(f"master.csv written: {len(df_enriched)} rows, 0 blank cells confirmed.")
-    if len(df_enriched) > 120:
-        print("WARNING: Row count unusually high — review raw.csv for remaining junk entries.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Project Kestrel enricher")
-    parser.add_argument("--input", default="data/raw_ece_data.csv", help="Input raw CSV path")
+    parser.add_argument("--input", default="data/raw.csv", help="Input raw CSV path")
     parser.add_argument("--output", default="data/master.csv", help="Output master CSV path")
     parser.add_argument("--centre-lat", type=float, default=DEFAULT_TARGET_LAT, help="Centre latitude")
     parser.add_argument("--centre-lng", type=float, default=DEFAULT_TARGET_LNG, help="Centre longitude")
@@ -471,7 +374,6 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    print(">>> SCRIPT STARTING")
     args = parse_args()
     enrich(
         input_csv=args.input,
@@ -480,4 +382,3 @@ if __name__ == "__main__":
         centre_lng=args.centre_lng,
         radius_km=args.radius,
     )
-    print(">>> SCRIPT FINISHED SUCCESSFULLY")

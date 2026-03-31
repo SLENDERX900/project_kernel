@@ -1,18 +1,14 @@
 import argparse
 import os
-import sys
-import json
-import time
 import re
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
-from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim as GeopyNominatim
+from geopy.geocoders import Nominatim
 from thefuzz import fuzz
 
 load_dotenv()
@@ -27,38 +23,36 @@ ELMINA_LNG = 101.4800
 ELMINA_RADIUS_METERS = 4000
 
 ECE_SYNONYMS = [
-    "tadika", "taska", "preschool", "kindergarten",
-    "playschool", "educare", "childcare",
-    "pusat jagaan", "pusat perkembangan",
-]
-
-JUNK_PATTERNS = [
-    r"preschool/kindergarten in \w",
-    r"selected preschools in",
-    r"best \d+ preschools",
-    r"most prestigious",
-    r"selected international preschools",
-    r"^read also:",
-    r"preschool in \w+ \| fees",
-]
-
-NON_ECE_KEYWORDS = [
-    "tuition", "tuisyen", "academy for teens", "secondary", "high school",
-    "college", "university", "clinic", "hospital", "restaurant", "gym",
-]
-
-IGNORE_EXACT_WORDS = [
-    "tadika", "taska", "preschool", "kindergarten", "transit", "childcare", "lain-lain"
+    "tadika",
+    "taska",
+    "preschool",
+    "kindergarten",
+    "playschool",
+    "educare",
+    "childcare",
+    "pusat jagaan",
+    "pusat perkembangan",
 ]
 
 RAW_COLUMNS = [
-    "centre_name", "address", "neighbourhood", "lat", "lng",
-    "curriculum", "language_medium", "fee_halfday_raw",
-    "fee_fullday_raw", "scale", "religious_orientation",
-    "is_moe_registered", "source_primary", "source_notes",
+    "centre_name",
+    "address",
+    "neighbourhood",
+    "lat",
+    "lng",
+    "curriculum",
+    "language_medium",
+    "fee_halfday_raw",
+    "fee_fullday_raw",
+    "scale",
+    "religious_orientation",
+    "is_moe_registered",
+    "source_primary",
+    "source_notes",
 ]
 
 
+# ---------------------- Utility helpers ----------------------
 def log(msg: str) -> None:
     print(msg)
 
@@ -70,9 +64,9 @@ def safe_text(val: Optional[str], default: str = "") -> str:
 
 
 def geocode_address(address: str) -> Tuple[float, float, bool]:
-    geolocator = GeopyNominatim(user_agent="project-kestrel-fetcher")
+    geolocator = Nominatim(user_agent="project-kestrel-fetcher")
     try:
-        loc = geolocator.geocode(address, timeout=10)
+        loc = geolocator.geocode(address)
         if loc:
             return float(loc.latitude), float(loc.longitude), True
     except Exception as exc:
@@ -86,13 +80,34 @@ def is_within_radius(centre_lat: float, centre_lng: float, point_lat: float, poi
     return geodesic(centre, point).km <= radius_km
 
 
+def parse_fee_values(text: str) -> List[str]:
+    if not text:
+        return []
+    return re.findall(r"RM\s*[\d,]+", text, flags=re.IGNORECASE)
+
+
 def blank_record() -> Dict:
-    return {k: ("" if k not in ["lat", "lng", "is_moe_registered"] else (False if k == "is_moe_registered" else None)) for k in RAW_COLUMNS}
+    return {
+        "centre_name": "",
+        "address": "",
+        "neighbourhood": "",
+        "lat": None,
+        "lng": None,
+        "curriculum": "",
+        "language_medium": "",
+        "fee_halfday_raw": "",
+        "fee_fullday_raw": "",
+        "scale": "",
+        "religious_orientation": "",
+        "is_moe_registered": False,
+        "source_primary": "",
+        "source_notes": "",
+    }
 
 
 def merge_records(existing: Dict, new: Dict) -> Dict:
     for key in RAW_COLUMNS:
-        if key == "is_moe_registered":
+        if key in ["is_moe_registered"]:
             existing[key] = bool(existing.get(key, False) or new.get(key, False))
             continue
         if not safe_text(existing.get(key)) and safe_text(new.get(key)):
@@ -115,63 +130,43 @@ def deduplicate(records: List[Dict]) -> List[Dict]:
                 dist = geodesic((record["lat"], record["lng"]), (existing["lat"], existing["lng"])).meters
             else:
                 dist = 999999
-
+            # BRANCH SEPARATION: check distance BEFORE checking name similarity
+            # MERGE only if name is similar AND they are physically close together
             if name_sim > 85 and dist < 300:
                 seen[idx] = merge_records(existing, record)
                 duplicate_found = True
                 break
-            elif name_sim > 92 and record.get("lat") is None and existing.get("lat") is None:
-                seen[idx] = merge_records(existing, record)
-                duplicate_found = True
-                break
+            # DO NOT merge branches — same brand name but far apart = separate rows
         if not duplicate_found:
             seen.append(record)
     return seen
 
 
-def is_junk_name(name: str) -> bool:
-    name_lower = safe_text(name).lower().strip()
-    return any(re.search(p, name_lower) for p in JUNK_PATTERNS)
-
-
-def is_non_ece(name: str) -> bool:
-    name_lower = safe_text(name).lower()
-    return any(kw in name_lower for kw in NON_ECE_KEYWORDS)
-
-
+# ---------------------- Source 1: Overpass ----------------------
 def fetch_overpass(centre_lat: float, centre_lng: float, radius_km: float) -> List[Dict]:
-    log("[Overpass] Fetching OpenStreetMap Data...")
+    log("[Overpass] Fetching...")
     out = []
+    endpoint = "https://overpass-api.de/api/interpreter"
 
-    mirrors = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.openstreetmap.fr/api/interpreter"
-    ]
-
-    headers = {'User-Agent': 'ProjectKestrelBot/1.0 (mailto:data@example.com)'}
     queries = [
         (centre_lat, centre_lng, int(radius_km * 1000), "main"),
         (ELMINA_LAT, ELMINA_LNG, ELMINA_RADIUS_METERS, "elmina"),
     ]
 
     for q_lat, q_lng, q_radius, label in queries:
-        overpass_ql = f"""
-        [out:json][timeout:25];
-        (
-          node["amenity"~"kindergarten|childcare"](around:{q_radius},{q_lat},{q_lng});
-          way["amenity"~"kindergarten|childcare"](around:{q_radius},{q_lat},{q_lng});
-        );
-        out center;
-        """.strip()
-
-        success = False
-        for mirror in mirrors:
-            if success:
-                break
-            log(f"[Overpass] Trying mirror: {mirror.split('//')[1].split('/')[0]} for {label}...")
+        for synonym in ECE_SYNONYMS:
+            overpass_ql = f"""
+[out:json][timeout:60];
+(
+  node[\"amenity\"=\"kindergarten\"][\"name\"~\"{synonym}\", i](around:{q_radius},{q_lat},{q_lng});
+  node[\"amenity\"=\"childcare\"][\"name\"~\"{synonym}\", i](around:{q_radius},{q_lat},{q_lng});
+  way[\"amenity\"=\"kindergarten\"][\"name\"~\"{synonym}\", i](around:{q_radius},{q_lat},{q_lng});
+  way[\"amenity\"=\"childcare\"][\"name\"~\"{synonym}\", i](around:{q_radius},{q_lat},{q_lng});
+);
+out center;
+""".strip()
             try:
-                resp = requests.post(mirror, data={'data': overpass_ql}, headers=headers, timeout=20)
+                resp = requests.post(endpoint, data=overpass_ql, timeout=60)
                 resp.raise_for_status()
                 payload = resp.json()
                 for el in payload.get("elements", []):
@@ -179,198 +174,283 @@ def fetch_overpass(centre_lat: float, centre_lng: float, radius_km: float) -> Li
                     lng = el.get("lon") or el.get("center", {}).get("lon")
                     if lat is None or lng is None:
                         continue
-
                     rec = blank_record()
                     tags = el.get("tags", {})
                     rec["centre_name"] = safe_text(tags.get("name"), "Unnamed ECE Centre")
-                    rec["address"] = ", ".join(filter(None, [
-                        safe_text(tags.get("addr:housenumber")),
-                        safe_text(tags.get("addr:street")),
-                        safe_text(tags.get("addr:city"))
-                    ])).strip(", ")
+                    rec["address"] = ", ".join(
+                        [
+                            safe_text(tags.get("addr:housenumber")),
+                            safe_text(tags.get("addr:street")),
+                            safe_text(tags.get("addr:city")),
+                        ]
+                    ).strip(", ")
                     rec["lat"] = float(lat)
                     rec["lng"] = float(lng)
-                    rec["source_primary"] = "Overpass API"
-                    rec["source_notes"] = f"[{label} area]"
+                    rec["source_primary"] = "Overpass API (OpenStreetMap)"
+                    rec["source_notes"] = f"[Verified: Overpass API ({label}, synonym={synonym})]"
                     out.append(rec)
-                success = True
             except Exception as exc:
-                log(f"[Overpass] Failed on mirror {mirror}: {exc}")
-
+                log(f"Source Overpass API failed ({label}, {synonym}): {exc}. Continuing.")
     log(f"[Overpass] Collected {len(out)} rows")
     return out
 
 
-def fetch_osm_nominatim() -> List[Dict]:
-    log("[Nominatim] Fetching OpenStreetMap Geocoding Data...")
+# ---------------------- Source 2: data.gov.my ----------------------
+def fetch_data_gov_my() -> List[Dict]:
+    log("[data.gov.my] Fetching...")
     out = []
-    headers = {'User-Agent': 'ProjectKestrelBot/1.0 (mailto:data@example.com)'}
+    base = "https://api.data.gov.my/data-catalogue"
+    keywords = ["prasekolah", "taska", "pendidikan awal"]
 
-    queries = ["kindergarten in Shah Alam", "preschool in Shah Alam", "tadika in Shah Alam"]
+    try:
+        idx = requests.get(base, timeout=30)
+        idx.raise_for_status()
+        datasets = idx.json() if isinstance(idx.json(), list) else []
+    except Exception as exc:
+        log(f"Source data.gov.my failed at catalogue listing: {exc}. Continuing.")
+        return out
 
-    for q in queries:
-        try:
-            url = "https://nominatim.openstreetmap.org/search"
-            params = {"q": q, "format": "json", "addressdetails": 1, "limit": 40}
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
+    candidate_ids = []
+    for item in datasets:
+        text = f"{item.get('title', '')} {item.get('description', '')}".lower()
+        if any(k in text for k in keywords):
+            dsid = item.get("id") or item.get("slug")
+            if dsid:
+                candidate_ids.append(str(dsid))
 
-            for item in resp.json():
-                rec = blank_record()
-                rec["centre_name"] = item.get("name", "").split(",")[0]
-                if not rec["centre_name"] or len(rec["centre_name"]) < 4:
+    for dsid in candidate_ids[:30]:
+        for synonym in ECE_SYNONYMS:
+            try:
+                url = f"{base}/{dsid}"
+                resp = requests.get(url, params={"state": "Selangor", "q": synonym}, timeout=30)
+                if resp.status_code >= 400:
                     continue
-
-                rec["address"] = item.get("display_name", "")
-                rec["lat"] = float(item.get("lat"))
-                rec["lng"] = float(item.get("lon"))
-                rec["source_primary"] = "Nominatim API"
-                out.append(rec)
-            time.sleep(1)
-        except Exception as e:
-            log(f"[Nominatim] Failed for query '{q}': {e}")
-
-    log(f"[Nominatim] Collected {len(out)} rows")
+                payload = resp.json()
+                rows = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
+                for row in rows:
+                    name = safe_text(row.get("name") or row.get("centre_name") or row.get("nama") or row.get("premise_name"))
+                    if not name:
+                        continue
+                    rec = blank_record()
+                    rec["centre_name"] = name
+                    rec["address"] = safe_text(row.get("address") or row.get("alamat") or row.get("lokasi"))
+                    rec["is_moe_registered"] = True
+                    rec["source_primary"] = "data.gov.my Open API"
+                    rec["source_notes"] = f"[Verified: MOE Registry — data.gov.my | synonym={synonym}]"
+                    out.append(rec)
+            except Exception as exc:
+                log(f"Source data.gov.my failed ({dsid}, {synonym}): {exc}. Continuing.")
+    log(f"[data.gov.my] Collected {len(out)} rows")
     return out
 
 
-def fetch_data_gov_my() -> int:
-    log("[data.gov.my] Fetching summary...")
+def enrich_with_moe_registry(records: List[Dict], moe_records: List[Dict]) -> None:
+    for rec in records:
+        for moe in moe_records:
+            if fuzz.token_sort_ratio(rec.get("centre_name", ""), moe.get("centre_name", "")) > 80:
+                rec["is_moe_registered"] = True
+                notes = safe_text(rec.get("source_notes"))
+                tag = "[Verified: MOE Registry — data.gov.my]"
+                if tag not in notes:
+                    rec["source_notes"] = (notes + " | " + tag).strip(" |")
+                break
+
+
+# ---------------------- Source 3: Kiddy123 ----------------------
+def parse_kiddy_listing(list_url: str) -> List[Tuple[str, str, str]]:
+    centres = []
     try:
-        url = "https://storage.data.gov.my/education/schools_district.csv"
-        df = pd.read_csv(url)
-        df_filtered = df[(df['state'] == 'Selangor') & (df['district'] == 'Petaling')].copy()
-        total = int(df_filtered['schools'].sum())
-        os.makedirs("data", exist_ok=True)
-        with open("data/gov_summary.json", "w") as f:
-            json.dump({"total_gov_schools_petaling": total}, f, indent=4)
-        log(f"[data.gov.my] Total government schools in Petaling: {total}")
-        return total
+        page = requests.get(list_url, timeout=30)
+        page.raise_for_status()
+        soup = BeautifulSoup(page.text, "html.parser")
+
+        for a in soup.select("a[href]"):
+            href = a.get("href", "")
+            text = a.get_text(" ", strip=True)
+            if not text:
+                continue
+            if "/" in href and "kiddy123.com" in href and any(term in text.lower() for term in ECE_SYNONYMS):
+                centres.append((text, "", href))
     except Exception as exc:
-        log(f"[data.gov.my] Fetch failed: {exc}. Continuing.")
-        return 0
+        log(f"Source Kiddy123 failed at listing {list_url}: {exc}. Continuing.")
+    return centres
 
 
-def fetch_local_directories() -> List[Dict]:
-    log("[Directories] Fetching Kiddy123, Anak2U, GogoKids, and EduDestination natively via Playwright...")
+def parse_kiddy_detail(name: str, url: str) -> Dict:
+    rec = blank_record()
+    rec["centre_name"] = name
+    rec["source_primary"] = "Kiddy123 Directory"
+    rec["source_notes"] = "[Verified: Kiddy123 directory]"
+
+    try:
+        detail = requests.get(url, timeout=30)
+        detail.raise_for_status()
+        soup = BeautifulSoup(detail.text, "html.parser")
+        page_text = soup.get_text(" ", strip=True)
+
+        fees = parse_fee_values(page_text)
+        if fees:
+            rec["fee_halfday_raw"] = fees[0]
+            rec["fee_fullday_raw"] = fees[-1]
+
+        rec["curriculum"] = safe_text(page_text[:500])
+        rec["language_medium"] = ""
+
+        address_node = soup.find(string=re.compile(r"Address", re.IGNORECASE))
+        if address_node:
+            rec["address"] = safe_text(address_node.parent.get_text(" ", strip=True))
+    except Exception as exc:
+        log(f"Source Kiddy123 failed at detail {url}: {exc}. Continuing.")
+    return rec
+
+
+def fetch_kiddy123() -> List[Dict]:
+    log("[Kiddy123] Fetching...")
     out = []
-
-    targets = [
-        ("Kiddy123", "https://www.kiddy123.com/article/selected-preschools-in-shah-alam"),
-        ("Kiddy123", "https://www.kiddy123.com/article/selected-preschools-in-setia-alam"),
-        ("Anak2U", "https://explore.anak2u.com.my/negeri/selangor/Shah-Alam-14"),
-        ("Anak2U", "https://explore.anak2u.com.my/negeri/selangor/Setia-Alam-2"),
-        ("GogoKids", "https://www.gogokids.my/kindergarten/selangor/"),
-        ("EduDestination", "https://educationdestinationmalaysia.com/schools/preschool-kindergarten/selangor")
+    urls = [
+        "https://www.kiddy123.com/malaysia/selangor/shah-alam/",
+        "https://www.kiddy123.com/malaysia/selangor/setia-alam/",
     ]
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page = context.new_page()
+    for list_url in urls:
+        for name, _addr, detail_url in parse_kiddy_listing(list_url):
+            rec = parse_kiddy_detail(name, detail_url)
+            out.append(rec)
 
-            for source, url in targets:
-                try:
-                    log(f"[{source}] Scraping: {url.split('/')[-1] or 'selangor'}")
-                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                    soup = BeautifulSoup(page.content(), "html.parser")
-
-                    for a in soup.select("a"):
-                        text = a.get_text(" ", strip=True)
-                        href = a.get("href", "")
-
-                        if not text or len(text) < 5 or text.lower() in IGNORE_EXACT_WORDS:
-                            continue
-
-                        is_valid = False
-
-                        if source == "Kiddy123" and "kiddy123.com" in href and any(t in text.lower() for t in ECE_SYNONYMS):
-                            is_valid = True
-                        elif source == "Anak2U" and any(t in text.lower() for t in ECE_SYNONYMS):
-                            is_valid = True
-                        elif source == "GogoKids" and "school" in href.lower() and any(t in text.lower() for t in ECE_SYNONYMS):
-                            is_valid = True
-                        elif source == "EduDestination" and any(t in text.lower() for t in ECE_SYNONYMS):
-                            is_valid = True
-
-                        if is_valid:
-                            rec = blank_record()
-                            rec["centre_name"] = text
-                            rec["source_primary"] = source
-                            out.append(rec)
-
-                except Exception as e:
-                    log(f"[{source}] Failed to parse {url}: {e}")
-            browser.close()
-    except Exception as e:
-        log(f"[Directories] Playwright failed: {e}")
-
-    log(f"[Directories] Collected {len(out)} rows")
+    log(f"[Kiddy123] Collected {len(out)} rows")
     return out
 
 
+# ---------------------- Source 4: Foursquare ----------------------
+def fetch_foursquare(centre_lat: float, centre_lng: float, radius_km: float) -> List[Dict]:
+    log("[Foursquare] Fetching...")
+    out = []
+    key = os.getenv("FOURSQUARE_KEY")
+    if not key:
+        log("FOURSQUARE_KEY not found — skipping Foursquare source")
+        return out
+
+    endpoint = "https://api.foursquare.com/v3/places/search"
+    headers = {"Authorization": key}
+
+    query_points = [
+        (centre_lat, centre_lng, int(radius_km * 1000), "main"),
+        (ELMINA_LAT, ELMINA_LNG, ELMINA_RADIUS_METERS, "elmina"),
+    ]
+
+    for q_lat, q_lng, q_radius, label in query_points:
+        for synonym in ECE_SYNONYMS:
+            params = {
+                "ll": f"{q_lat},{q_lng}",
+                "radius": q_radius,
+                "categories": "12058,12056",
+                "limit": 50,
+                "fields": "name,location,geocodes,rating,categories",
+                "query": synonym,
+            }
+            try:
+                resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
+                resp.raise_for_status()
+                for item in resp.json().get("results", []):
+                    rec = blank_record()
+                    rec["centre_name"] = safe_text(item.get("name"), "Unnamed ECE Centre")
+                    loc = item.get("location", {})
+                    geocodes = item.get("geocodes", {}).get("main", {})
+                    rec["address"] = safe_text(loc.get("formatted_address"))
+                    rec["lat"] = geocodes.get("latitude")
+                    rec["lng"] = geocodes.get("longitude")
+                    rec["source_primary"] = "Foursquare Places API"
+                    rating = item.get("rating")
+                    rec["source_notes"] = f"[Verified: Foursquare Places API] Foursquare rating: {rating}/10 | scope={label} | synonym={synonym}"
+                    out.append(rec)
+            except Exception as exc:
+                log(f"Source Foursquare failed ({label}, {synonym}): {exc}. Continuing.")
+
+    log(f"[Foursquare] Collected {len(out)} rows")
+    return out
+
+
+# ---------------------- Source 5: SerpAPI ----------------------
 def fetch_serpapi() -> List[Dict]:
+    log("[SerpAPI] Fetching...")
+    out = []
     key = os.getenv("SERPAPI_KEY")
     if not key:
-        log("[SerpAPI] Key not found — skipping.")
-        return []
+        log("SERPAPI_KEY not found — skipping SerpAPI source")
+        return out
 
-    log("[SerpAPI] Fetching Google Search results...")
-    out = []
     endpoint = "https://serpapi.com/search.json"
-    queries = ["tadika Bukit Jelutong", "preschool Setia Alam", "taska Elmina Shah Alam", "childcare Glenmarie", "kindergarten Denai Alam"]
 
-    for q in queries:
-        params = {"engine": "google", "q": q, "api_key": key, "num": 10}
+    fixed_queries = [
+        "tadika Bukit Jelutong Shah Alam",
+        "taska Bukit Jelutong",
+        "preschool Setia Alam Shah Alam",
+        "tadika Elmina Shah Alam",
+        "taska Elmina Kota Elmina",
+        "kindergarten Denai Alam",
+        "preschool Glenmarie Shah Alam",
+        "tadika facebook Setia Alam",
+        "taska Elmina Shah Alam",
+        "tadika Kota Elmina",
+        "preschool Elmina",
+    ]
+
+    dynamic_areas = [
+        "Bukit Jelutong Shah Alam",
+        "Setia Alam Shah Alam",
+        "Denai Alam",
+        "Elmina Shah Alam",
+        "Kota Elmina",
+        "Glenmarie Shah Alam",
+    ]
+
+    all_queries = set(fixed_queries)
+    for term in ECE_SYNONYMS:
+        for area in dynamic_areas:
+            all_queries.add(f"{term} {area}")
+
+    for q in sorted(all_queries):
+        params = {"engine": "google", "q": q, "api_key": key, "num": 20}
         try:
-            log(f"[SerpAPI] Querying: {q}")
             resp = requests.get(endpoint, params=params, timeout=30)
             resp.raise_for_status()
-            results = resp.json().get("organic_results", [])
-            log(f"[SerpAPI] Found {len(results)} results for '{q}'")
-
-            for result in results:
-                raw_title = safe_text(result.get("title"))
-                candidate_name = safe_text(raw_title).split("-")[0].strip()
-                candidate_name = re.sub(
-                    r"^(tadika|taska|preschool|kindergarten|playschool|educare|childcare|pusat jagaan|pusat perkembangan)\\s*",
-                    "",
-                    candidate_name,
-                    flags=re.IGNORECASE,
-                ).strip()
-                candidate_name = candidate_name.strip("() ").strip()
-
-                if is_junk_name(raw_title) or is_junk_name(candidate_name):
-                    log(f"Rejected junk entry: {raw_title}")
-                    continue
-
-                if not candidate_name or len(candidate_name) < 5 or candidate_name in {"()", ""}:
-                    log(f"Skipped unnamed entry from SerpAPI: {raw_title}")
+            payload = resp.json()
+            for result in payload.get("organic_results", []):
+                title = safe_text(result.get("title"))
+                snippet = safe_text(result.get("snippet"))
+                hay = (title + " " + snippet).lower()
+                if not any(term in hay for term in ECE_SYNONYMS):
                     continue
 
                 rec = blank_record()
-                rec["centre_name"] = candidate_name
-                rec["address"] = safe_text(result.get("snippet"))
-                rec["source_primary"] = "SerpAPI"
+                rec["centre_name"] = title.split("-")[0].strip() or title
+                rec["address"] = snippet
+                rec["source_primary"] = "SerpAPI (Google Search)"
+                rec["source_notes"] = f"[Verified: SerpAPI — Google Search result] query='{q}'"
                 out.append(rec)
         except Exception as exc:
-            log(f"[SerpAPI] Failed for '{q}': {exc}")
+            log(f"Source SerpAPI failed ({q}): {exc}. Continuing.")
 
     log(f"[SerpAPI] Collected {len(out)} rows")
     return out
 
 
+# ---------------------- Post-processing ----------------------
 def validate_radius(records: List[Dict], centre_lat: float, centre_lng: float, radius_km: float) -> Tuple[List[Dict], int]:
-    kept, excluded = [], 0
+    kept = []
+    excluded = 0
     for rec in records:
-        lat, lng = rec.get("lat"), rec.get("lng")
+        lat = rec.get("lat")
+        lng = rec.get("lng")
         if lat is None or lng is None:
             kept.append(rec)
-        elif is_within_radius(centre_lat, centre_lng, float(lat), float(lng), radius_km):
+            continue
+        if is_within_radius(centre_lat, centre_lng, float(lat), float(lng), radius_km):
             kept.append(rec)
         else:
             excluded += 1
+            dist = geodesic((centre_lat, centre_lng), (float(lat), float(lng))).km
+            log(f"Excluded {rec.get('centre_name', 'unknown')} — {dist:.2f}km from centre")
     return kept, excluded
 
 
@@ -382,45 +462,55 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_pipeline(address: str, radius_km: float, output_csv: str) -> None:
-    centre_lat, centre_lng, ok = geocode_address(address)
-    log(f"Resolved centre: {centre_lat:.4f}, {centre_lng:.4f}" if ok else "Geocoding failed.")
+    centre_lat, centre_lng, geocode_ok = geocode_address(address)
+    if geocode_ok:
+        log(f"Resolved centre: {centre_lat:.4f}, {centre_lng:.4f}")
+    else:
+        log(f"Address geocoding failed. Falling back to default {DEFAULT_LAT:.4f}, {DEFAULT_LNG:.4f}")
 
-    all_records = []
+    all_records: List[Dict] = []
+    source_counter = 0
 
-    all_records.extend(fetch_overpass(centre_lat, centre_lng, radius_km))
-    all_records.extend(fetch_osm_nominatim())
+    overpass_rows = fetch_overpass(centre_lat, centre_lng, radius_km)
+    all_records.extend(overpass_rows)
+    source_counter += 1
 
-    fetch_data_gov_my()
+    moe_rows = fetch_data_gov_my()
+    source_counter += 1
 
-    all_records.extend(fetch_local_directories())
+    kiddy_rows = fetch_kiddy123()
+    all_records.extend(kiddy_rows)
+    source_counter += 1
 
-    all_records.extend(fetch_serpapi())
+    foursquare_rows = fetch_foursquare(centre_lat, centre_lng, radius_km)
+    all_records.extend(foursquare_rows)
+    source_counter += 1
 
-    filtered_records = []
-    for rec in all_records:
-        name = safe_text(rec.get("centre_name"))
-        if is_non_ece(name):
-            log(f"Filtered non-ECE entry: {name}")
-            continue
-        filtered_records.append(rec)
-    all_records = filtered_records
+    serp_rows = fetch_serpapi()
+    all_records.extend(serp_rows)
+    source_counter += 1
+
+    enrich_with_moe_registry(all_records, moe_rows)
 
     deduped = deduplicate(all_records)
     within_radius, excluded = validate_radius(deduped, centre_lat, centre_lng, radius_km)
 
-    df = ensure_schema(pd.DataFrame(within_radius))
+    df = pd.DataFrame(within_radius)
+    df = ensure_schema(df)
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
+    log(f"raw.csv written: {len(df)} rows from {source_counter} sources. {excluded} rows excluded.")
 
-    log(f"\nSUCCESS: Written {len(df)} rows to {output_csv}")
-    log(f"Excluded {excluded} out-of-bounds rows.")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Project Kestrel fetcher")
+    parser.add_argument("--address", default=DEFAULT_ADDRESS, help="Search centre address")
+    parser.add_argument("--radius", type=float, default=DEFAULT_RADIUS_KM, help="Search radius in km")
+    parser.add_argument("--output", default="data/raw.csv", help="Output CSV path")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--address", default=DEFAULT_ADDRESS)
-    parser.add_argument("--radius", type=float, default=DEFAULT_RADIUS_KM)
-    parser.add_argument("--output", default="data/raw_ece_data.csv")
-    args = parser.parse_args()
-    run_pipeline(args.address, args.radius, args.output)
+    args = parse_args()
+    run_pipeline(address=args.address, radius_km=args.radius, output_csv=args.output)
