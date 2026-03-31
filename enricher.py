@@ -1,21 +1,12 @@
 import argparse
 import os
 import re
-import sys
-import time
 from datetime import datetime
 from typing import Dict, Tuple
 
-# Add local packages to path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-local_packages = os.path.join(current_dir, 'packages')
-if os.path.exists(local_packages):
-    sys.path.insert(0, local_packages)
-
 import pandas as pd
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim as GeopyNominatim, ArcGIS, Photon
-from duckduckgo_search import DDGS
+from geopy.geocoders import Nominatim
 
 DEFAULT_TARGET_LAT = 3.1022
 DEFAULT_TARGET_LNG = 101.5333
@@ -58,16 +49,6 @@ REQUIRED_COLUMNS = [
     "language_medium", "fee_halfday_raw", "fee_fullday_raw",
     "scale", "religious_orientation", "source_notes",
 ]
-
-EVIDENCE_KEYWORDS = [
-    "Tadika", "Taska", "Preschool", "Kindergarten", "School", "Tabika",
-    "Playschool", "Childcare", "Daycare", "Enrolment", "Ages 3-6", "KSPK", "Early Years",
-]
-NON_ECE_TERMS = [
-    "restaurant", "grocery", "clothing", "boutique", "salon", "barber", "cafe",
-    "bakery", "car wash", "pharmacy", "dental", "clinic", "hospital", "hotel",
-]
-FORMAL_NAME_HINTS = ["tadika", "taska", "tabika", "preschool", "kindergarten", "childcare", "daycare"]
 
 TARGET_ROWS = [
     {
@@ -199,116 +180,36 @@ def assign_neighbourhood(lat: float, lng: float, address: str) -> str:
 
 
 def validate_and_fill_coordinates(df: pd.DataFrame, centre_lat: float, centre_lng: float, radius_km: float) -> pd.DataFrame:
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "ProjectKestrelBot/1.0 (https://project-kestrel.example.com; research-data@example.com)"
-    ]
-
+    geolocator = Nominatim(user_agent="project-kestrel-enricher")
     geocoded = 0
     excluded = 0
-    failed_geocoding = 0
 
     keep_rows = []
-    total_rows = len(df)
-    print(f"Starting coordinate validation for {total_rows} rows...")
-    accepted_location_hints = ["shah alam", "selangor", "bukit jelutong", "setia alam", "elmina", "denai alam", "subang"]
-
-    arcgis = ArcGIS(user_agent="project-kestrel-enricher-v2")
-    photon = Photon(user_agent="project-kestrel-enricher-v2")
-
-    nominatim_blocked = False
-
-    for i, (_, row) in enumerate(df.iterrows()):
+    for _, row in df.iterrows():
         lat = row.get("lat")
         lng = row.get("lng")
 
-        if (pd.isna(lat) or pd.isna(lng)):
-            addr = str(row.get("address", "")).strip()
-            name = str(row.get("centre_name", "")).strip()
-
-            if not addr or addr.lower() in ["nan", "none"]:
-                if name and name.lower() not in ["nan", "none"]:
-                    query = f"{name} Shah Alam"
+        if (pd.isna(lat) or pd.isna(lng)) and str(row.get("address", "")).strip():
+            try:
+                loc = geolocator.geocode(str(row.get("address")))
+                if loc:
+                    lat, lng = float(loc.latitude), float(loc.longitude)
+                    geocoded += 1
+                    row["lat"], row["lng"] = lat, lng
                 else:
-                    query = None
-            else:
-                query = addr
-
-            if query and query.lower() not in ["nan", "none", "shah alam"]:
-                if i % 10 == 0:
-                    print(f"Geocoding progress: {i}/{total_rows}...")
-
-                success = False
-
-                try:
-                    time.sleep(1)
-                    loc = arcgis.geocode(query, timeout=10)
-                    if loc:
-                        lat, lng = float(loc.latitude), float(loc.longitude)
-                        geocoded += 1
-                        row["lat"], row["lng"] = lat, lng
-                        success = True
-                except Exception:
-                    pass
-
-                if not success:
-                    try:
-                        time.sleep(1)
-                        loc = photon.geocode(query, timeout=10)
-                        if loc:
-                            lat, lng = float(loc.latitude), float(loc.longitude)
-                            geocoded += 1
-                            row["lat"], row["lng"] = lat, lng
-                            success = True
-                    except Exception:
-                        pass
-
-                if not success and not nominatim_blocked:
-                    for ua in user_agents:
-                        geolocator = GeopyNominatim(user_agent=ua)
-                        try:
-                            time.sleep(2)
-                            loc = geolocator.geocode(query, timeout=10)
-                            if loc:
-                                lat, lng = float(loc.latitude), float(loc.longitude)
-                                geocoded += 1
-                                row["lat"], row["lng"] = lat, lng
-                                success = True
-                                break
-                        except Exception as e:
-                            if "429" in str(e):
-                                print("Nominatim rate limited (429). Waiting 30 seconds and disabling for this run...")
-                                nominatim_blocked = True
-                                time.sleep(30)
-                                break
-                            elif "403" in str(e):
-                                pass
-                            else:
-                                print(f"Nominatim error: {e}")
-
-                if not success:
-                    failed_geocoding += 1
-                    row["lat"], row["lng"] = None, None
                     row["source_notes"] = f"{row.get('source_notes', '')} | [Geocoding failed — verify manually]".strip(" |")
+            except Exception:
+                row["source_notes"] = f"{row.get('source_notes', '')} | [Geocoding failed — verify manually]".strip(" |")
 
         if pd.notna(lat) and pd.notna(lng):
-            if float(lat) < 1.0 or float(lat) > 7.5 or float(lng) < 99.5 or float(lng) > 119.5:
-                print(f"Excluded {row.get('centre_name', 'unknown')} — coordinates outside Malaysia bounding box")
-                excluded += 1
-                continue
             if geodesic((centre_lat, centre_lng), (float(lat), float(lng))).km > radius_km:
-                excluded += 1
-                continue
-        else:
-            address_text = str(row.get("address", "")).lower()
-            if not any(hint in address_text for hint in accepted_location_hints):
                 excluded += 1
                 continue
 
         keep_rows.append(row)
 
     result = pd.DataFrame(keep_rows)
-    print(f"Coordinate validation: {len(result)} rows within radius. {excluded} excluded. {geocoded} geocoded. {failed_geocoding} failed.")
+    print(f"Coordinate validation: {len(result)} rows within radius. {excluded} excluded. {geocoded} geocoded.")
     return result
 
 
@@ -367,99 +268,6 @@ def normalize_text_cell(value: str, default_value: str) -> str:
     if txt.lower() in bad:
         return default_value
     return txt
-
-
-def _norm(txt: str) -> str:
-    return str(txt or "").strip()
-
-
-def has_ece_evidence(centre_name: str, source_notes: str, desc: str = "") -> bool:
-    hay = f"{centre_name} {source_notes} {desc}".lower()
-    return any(k.lower() in hay for k in EVIDENCE_KEYWORDS)
-
-
-def run_search(query: str, max_results: int = 8):
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
-
-
-def choose_formal_name(candidates, fallback: str) -> str:
-    best = fallback
-    for c in candidates:
-        c2 = _norm(c)
-        if any(h in c2.lower() for h in FORMAL_NAME_HINTS) and len(c2) > len(best):
-            best = c2
-    return best
-
-
-def verify_entity_fields(row: pd.Series) -> Tuple[str, Dict]:
-    centre_name = _norm(row.get("centre_name", ""))
-    neighbourhood = _norm(row.get("neighbourhood", ""))
-    source_notes = _norm(row.get("source_notes", ""))
-    address = _norm(row.get("address", ""))
-    curriculum = _norm(row.get("curriculum", ""))
-    fee_full = _norm(row.get("fee_fullday_raw", ""))
-
-    if "Reference — Target" in source_notes:
-        return "keep", {"is_verified_entity": True, "status": "VALID"}
-
-    updates = {"is_verified_entity": has_ece_evidence(centre_name, source_notes), "status": "VALID"}
-    query = f"{centre_name} {neighbourhood} Shah Alam"
-    try:
-        results = run_search(query)
-    except Exception as exc:
-        updates["is_verified_entity"] = False
-        updates["status"] = f"REVIEW_SEARCH_FAILED: {exc}"
-        return "keep", updates
-
-    ece_hits, non_ece_hits = 0, 0
-    titles = []
-    found_address = ""
-    found_fee = ""
-    found_curriculum = ""
-    for r in results:
-        title = _norm(r.get("title", ""))
-        snippet = _norm(r.get("body", ""))
-        link = _norm(r.get("href", ""))
-        joined = f"{title} {snippet} {link}".lower()
-        if any(t in joined for t in NON_ECE_TERMS):
-            non_ece_hits += 1
-        if any(k.lower() in joined for k in EVIDENCE_KEYWORDS):
-            ece_hits += 1
-        if title:
-            titles.append(title)
-        if ("[inferred" in address.lower() or not address) and not found_address:
-            m = re.search(r"\b(?:jalan|jln|persiaran|lorong|seksyen|bandar|taman|shah alam|selangor)[^|,.;]{6,}", snippet, flags=re.IGNORECASE)
-            if m:
-                found_address = m.group(0).strip(" ,.;")
-        if ("[inferred" in fee_full.lower() or re.search(r"rm\s*\d+\s*[–-]\s*\d+", fee_full.lower())) and not found_fee:
-            m2 = re.search(r"RM\s*[\d,]+(?:\s*[–-]\s*[\d,]+)?", snippet, flags=re.IGNORECASE)
-            if m2:
-                found_fee = m2.group(0).strip()
-        if not found_curriculum:
-            s = snippet.lower()
-            if "montessori" in s:
-                found_curriculum = "Montessori"
-            elif "cambridge" in s or "early years" in s:
-                found_curriculum = "Cambridge Early Years"
-            elif "kspk" in s:
-                found_curriculum = "KSPK"
-
-    if non_ece_hits > ece_hits and non_ece_hits >= 1:
-        return "trash", {"is_verified_entity": False, "status": "INVALID_NON_ECE"}
-
-    updates["is_verified_entity"] = ece_hits > 0
-    updates["status"] = "VALID" if ece_hits > 0 else "REVIEW"
-    formal = choose_formal_name(titles, centre_name)
-    if formal and formal != centre_name:
-        updates["centre_name"] = formal
-    if found_address:
-        updates["address"] = found_address
-    if found_fee:
-        updates["fee_fullday_raw"] = found_fee
-    if found_curriculum and (not curriculum or "[inferred" in curriculum.lower()):
-        updates["curriculum"] = found_curriculum
-    return "keep", updates
 
 
 def enrich(input_csv: str, output_csv: str, centre_lat: float, centre_lng: float, radius_km: float) -> None:
@@ -546,46 +354,18 @@ def enrich(input_csv: str, output_csv: str, centre_lat: float, centre_lng: float
     df_enriched["scale"] = df_enriched["scale"].apply(lambda x: normalize_text_cell(x, "Independent"))
     df_enriched["religious_orientation"] = df_enriched["religious_orientation"].apply(lambda x: normalize_text_cell(x, "Secular"))
 
-    REQUIRED_COLUMNS_CHECK = ["centre_name", "address", "lat", "lng"]
-    for col in REQUIRED_COLUMNS_CHECK:
-        if col not in df_enriched.columns:
-            print(f"Warning: Column '{col}' is missing from the final data!")
-            continue
-        blank_count = df_enriched[df_enriched[col].astype(str).str.strip().isin(["", "nan", "None"])].shape[0]
-        if blank_count > 0:
-            print(f"Warning: Column '{col}' still has {blank_count} blank entries.")
-        else:
-            print(f"Check passed: Column '{col}' has no blank entries.")
-
-    kept_rows = []
-    trash_rows = []
-    if "is_verified_entity" not in df_enriched.columns:
-        df_enriched["is_verified_entity"] = False
-    if "status" not in df_enriched.columns:
-        df_enriched["status"] = "PENDING"
-    for _, r in df_enriched.iterrows():
-        destination, updates = verify_entity_fields(r)
-        for k, v in updates.items():
-            r[k] = v
-        if destination == "trash":
-            trash_rows.append(r)
-        else:
-            kept_rows.append(r)
-        time.sleep(2)
-    df_enriched = pd.DataFrame(kept_rows)
-    trash_df = pd.DataFrame(trash_rows)
+    blank_count = int(df_enriched[REQUIRED_COLUMNS].isna().sum().sum())
+    blank_count += int((df_enriched[REQUIRED_COLUMNS].astype(str).apply(lambda s: s.str.strip()) == "").sum().sum())
+    assert blank_count == 0, f"Blank cell check failed: {blank_count}"
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df_enriched.to_csv(output_csv, index=False)
-    trash_df.to_csv("data/verified_master_trash.csv", index=False)
     print(f"master.csv written: {len(df_enriched)} rows, 0 blank cells confirmed.")
-    if len(df_enriched) > 120:
-        print("WARNING: Row count unusually high — review raw.csv for remaining junk entries.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Project Kestrel enricher")
-    parser.add_argument("--input", default="data/raw_ece_data.csv", help="Input raw CSV path")
+    parser.add_argument("--input", default="data/raw.csv", help="Input raw CSV path")
     parser.add_argument("--output", default="data/master.csv", help="Output master CSV path")
     parser.add_argument("--centre-lat", type=float, default=DEFAULT_TARGET_LAT, help="Centre latitude")
     parser.add_argument("--centre-lng", type=float, default=DEFAULT_TARGET_LNG, help="Centre longitude")
@@ -594,7 +374,6 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    print(">>> SCRIPT STARTING")
     args = parse_args()
     enrich(
         input_csv=args.input,
@@ -603,4 +382,3 @@ if __name__ == "__main__":
         centre_lng=args.centre_lng,
         radius_km=args.radius,
     )
-    print(">>> SCRIPT FINISHED SUCCESSFULLY")
