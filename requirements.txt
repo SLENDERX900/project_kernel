@@ -1,0 +1,13 @@
+streamlit
+pandas
+openpyxl
+requests
+beautifulsoup4
+folium
+streamlit-folium
+geopy
+python-dotenv
+thefuzz
+python-Levenshtein
+xlsxwriter
+plotly
