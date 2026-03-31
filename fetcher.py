@@ -1,7 +1,6 @@
 import argparse
 import os
 import re
-import time
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -11,8 +10,6 @@ from dotenv import load_dotenv
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 from thefuzz import fuzz
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -53,25 +50,6 @@ RAW_COLUMNS = [
     "source_primary",
     "source_notes",
 ]
-
-REQUEST_TIMEOUT = 25
-USER_AGENT = "ProjectKestrel/1.0 (+research pipeline)"
-
-
-def build_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "POST"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
 
 
 # ---------------------- Utility helpers ----------------------
@@ -165,14 +143,10 @@ def deduplicate(records: List[Dict]) -> List[Dict]:
 
 
 # ---------------------- Source 1: Overpass ----------------------
-def fetch_overpass(session: requests.Session, centre_lat: float, centre_lng: float, radius_km: float) -> List[Dict]:
+def fetch_overpass(centre_lat: float, centre_lng: float, radius_km: float) -> List[Dict]:
     log("[Overpass] Fetching...")
     out = []
-    endpoints = [
-        "https://lz4.overpass-api.de/api/interpreter",
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.openstreetmap.fr/api/interpreter",
-    ]
+    endpoint = "https://overpass-api.de/api/interpreter"
 
     queries = [
         (centre_lat, centre_lng, int(radius_km * 1000), "main"),
@@ -191,55 +165,45 @@ def fetch_overpass(session: requests.Session, centre_lat: float, centre_lng: flo
 );
 out center;
 """.strip()
-            payload = None
-            for endpoint in endpoints:
-                try:
-                    resp = session.post(endpoint, data=overpass_ql, timeout=REQUEST_TIMEOUT)
-                    if resp.status_code >= 400:
-                        log(f"Source Overpass API failed at {endpoint} ({label}, {synonym}): HTTP {resp.status_code}. Trying next mirror...")
+            try:
+                resp = requests.post(endpoint, data=overpass_ql, timeout=60)
+                resp.raise_for_status()
+                payload = resp.json()
+                for el in payload.get("elements", []):
+                    lat = el.get("lat") or el.get("center", {}).get("lat")
+                    lng = el.get("lon") or el.get("center", {}).get("lon")
+                    if lat is None or lng is None:
                         continue
-                    payload = resp.json()
-                    break
-                except requests.RequestException as exc:
-                    log(f"Source Overpass API failed at {endpoint} ({label}, {synonym}): {exc}. Trying next mirror...")
-                except Exception as exc:
-                    log(f"Source Overpass API parse error at {endpoint} ({label}, {synonym}): {exc}. Trying next mirror...")
-            if payload is None:
-                continue
-            for el in payload.get("elements", []):
-                lat = el.get("lat") or el.get("center", {}).get("lat")
-                lng = el.get("lon") or el.get("center", {}).get("lon")
-                if lat is None or lng is None:
-                    continue
-                rec = blank_record()
-                tags = el.get("tags", {})
-                rec["centre_name"] = safe_text(tags.get("name"), "Unnamed ECE Centre")
-                rec["address"] = ", ".join(
-                    [
-                        safe_text(tags.get("addr:housenumber")),
-                        safe_text(tags.get("addr:street")),
-                        safe_text(tags.get("addr:city")),
-                    ]
-                ).strip(", ")
-                rec["lat"] = float(lat)
-                rec["lng"] = float(lng)
-                rec["source_primary"] = "Overpass API (OpenStreetMap)"
-                rec["source_notes"] = f"[Verified: Overpass API ({label}, synonym={synonym})]"
-                out.append(rec)
-            time.sleep(0.2)
+                    rec = blank_record()
+                    tags = el.get("tags", {})
+                    rec["centre_name"] = safe_text(tags.get("name"), "Unnamed ECE Centre")
+                    rec["address"] = ", ".join(
+                        [
+                            safe_text(tags.get("addr:housenumber")),
+                            safe_text(tags.get("addr:street")),
+                            safe_text(tags.get("addr:city")),
+                        ]
+                    ).strip(", ")
+                    rec["lat"] = float(lat)
+                    rec["lng"] = float(lng)
+                    rec["source_primary"] = "Overpass API (OpenStreetMap)"
+                    rec["source_notes"] = f"[Verified: Overpass API ({label}, synonym={synonym})]"
+                    out.append(rec)
+            except Exception as exc:
+                log(f"Source Overpass API failed ({label}, {synonym}): {exc}. Continuing.")
     log(f"[Overpass] Collected {len(out)} rows")
     return out
 
 
 # ---------------------- Source 2: data.gov.my ----------------------
-def fetch_data_gov_my(session: requests.Session) -> List[Dict]:
+def fetch_data_gov_my() -> List[Dict]:
     log("[data.gov.my] Fetching...")
     out = []
     base = "https://api.data.gov.my/data-catalogue"
     keywords = ["prasekolah", "taska", "pendidikan awal"]
 
     try:
-        idx = session.get(base, timeout=REQUEST_TIMEOUT)
+        idx = requests.get(base, timeout=30)
         idx.raise_for_status()
         datasets = idx.json() if isinstance(idx.json(), list) else []
     except Exception as exc:
@@ -258,7 +222,7 @@ def fetch_data_gov_my(session: requests.Session) -> List[Dict]:
         for synonym in ECE_SYNONYMS:
             try:
                 url = f"{base}/{dsid}"
-                resp = session.get(url, params={"state": "Selangor", "q": synonym}, timeout=REQUEST_TIMEOUT)
+                resp = requests.get(url, params={"state": "Selangor", "q": synonym}, timeout=30)
                 if resp.status_code >= 400:
                     continue
                 payload = resp.json()
@@ -293,13 +257,11 @@ def enrich_with_moe_registry(records: List[Dict], moe_records: List[Dict]) -> No
 
 
 # ---------------------- Source 3: Kiddy123 ----------------------
-def parse_kiddy_listing(session: requests.Session, list_url: str) -> List[Tuple[str, str, str]]:
+def parse_kiddy_listing(list_url: str) -> List[Tuple[str, str, str]]:
     centres = []
     try:
-        page = session.get(list_url, timeout=REQUEST_TIMEOUT)
-        if page.status_code >= 400:
-            log(f"Source Kiddy123 listing unavailable ({page.status_code}) at {list_url}. Continuing.")
-            return centres
+        page = requests.get(list_url, timeout=30)
+        page.raise_for_status()
         soup = BeautifulSoup(page.text, "html.parser")
 
         for a in soup.select("a[href]"):
@@ -307,23 +269,22 @@ def parse_kiddy_listing(session: requests.Session, list_url: str) -> List[Tuple[
             text = a.get_text(" ", strip=True)
             if not text:
                 continue
-            if "kiddy123.com" in href and ("/listing/" in href or "/kindergarten/" in href):
+            if "/" in href and "kiddy123.com" in href and any(term in text.lower() for term in ECE_SYNONYMS):
                 centres.append((text, "", href))
     except Exception as exc:
         log(f"Source Kiddy123 failed at listing {list_url}: {exc}. Continuing.")
     return centres
 
 
-def parse_kiddy_detail(session: requests.Session, name: str, url: str) -> Dict:
+def parse_kiddy_detail(name: str, url: str) -> Dict:
     rec = blank_record()
     rec["centre_name"] = name
     rec["source_primary"] = "Kiddy123 Directory"
     rec["source_notes"] = "[Verified: Kiddy123 directory]"
 
     try:
-        detail = session.get(url, timeout=REQUEST_TIMEOUT)
-        if detail.status_code >= 400:
-            return rec
+        detail = requests.get(url, timeout=30)
+        detail.raise_for_status()
         soup = BeautifulSoup(detail.text, "html.parser")
         page_text = soup.get_text(" ", strip=True)
 
@@ -343,7 +304,7 @@ def parse_kiddy_detail(session: requests.Session, name: str, url: str) -> Dict:
     return rec
 
 
-def fetch_kiddy123(session: requests.Session) -> List[Dict]:
+def fetch_kiddy123() -> List[Dict]:
     log("[Kiddy123] Fetching...")
     out = []
     urls = [
@@ -352,8 +313,8 @@ def fetch_kiddy123(session: requests.Session) -> List[Dict]:
     ]
 
     for list_url in urls:
-        for name, _addr, detail_url in parse_kiddy_listing(session, list_url):
-            rec = parse_kiddy_detail(session, name, detail_url)
+        for name, _addr, detail_url in parse_kiddy_listing(list_url):
+            rec = parse_kiddy_detail(name, detail_url)
             out.append(rec)
 
     log(f"[Kiddy123] Collected {len(out)} rows")
@@ -361,7 +322,7 @@ def fetch_kiddy123(session: requests.Session) -> List[Dict]:
 
 
 # ---------------------- Source 4: Foursquare ----------------------
-def fetch_foursquare(session: requests.Session, centre_lat: float, centre_lng: float, radius_km: float) -> List[Dict]:
+def fetch_foursquare(centre_lat: float, centre_lng: float, radius_km: float) -> List[Dict]:
     log("[Foursquare] Fetching...")
     out = []
     key = os.getenv("FOURSQUARE_KEY")
@@ -388,7 +349,7 @@ def fetch_foursquare(session: requests.Session, centre_lat: float, centre_lng: f
                 "query": synonym,
             }
             try:
-                resp = session.get(endpoint, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+                resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
                 resp.raise_for_status()
                 for item in resp.json().get("results", []):
                     rec = blank_record()
@@ -410,7 +371,7 @@ def fetch_foursquare(session: requests.Session, centre_lat: float, centre_lng: f
 
 
 # ---------------------- Source 5: SerpAPI ----------------------
-def fetch_serpapi(session: requests.Session) -> List[Dict]:
+def fetch_serpapi() -> List[Dict]:
     log("[SerpAPI] Fetching...")
     out = []
     key = os.getenv("SERPAPI_KEY")
@@ -451,7 +412,7 @@ def fetch_serpapi(session: requests.Session) -> List[Dict]:
     for q in sorted(all_queries):
         params = {"engine": "google", "q": q, "api_key": key, "num": 20}
         try:
-            resp = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(endpoint, params=params, timeout=30)
             resp.raise_for_status()
             payload = resp.json()
             for result in payload.get("organic_results", []):
@@ -501,7 +462,6 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_pipeline(address: str, radius_km: float, output_csv: str) -> None:
-    session = build_session()
     centre_lat, centre_lng, geocode_ok = geocode_address(address)
     if geocode_ok:
         log(f"Resolved centre: {centre_lat:.4f}, {centre_lng:.4f}")
@@ -511,40 +471,24 @@ def run_pipeline(address: str, radius_km: float, output_csv: str) -> None:
     all_records: List[Dict] = []
     source_counter = 0
 
-    try:
-        overpass_rows = fetch_overpass(session, centre_lat, centre_lng, radius_km)
-        all_records.extend(overpass_rows)
-        source_counter += 1
-    except Exception as exc:
-        log(f"Source Overpass API failed: {exc}. Continuing.")
+    overpass_rows = fetch_overpass(centre_lat, centre_lng, radius_km)
+    all_records.extend(overpass_rows)
+    source_counter += 1
 
-    try:
-        moe_rows = fetch_data_gov_my(session)
-        source_counter += 1
-    except Exception as exc:
-        log(f"Source data.gov.my failed: {exc}. Continuing.")
-        moe_rows = []
+    moe_rows = fetch_data_gov_my()
+    source_counter += 1
 
-    try:
-        kiddy_rows = fetch_kiddy123(session)
-        all_records.extend(kiddy_rows)
-        source_counter += 1
-    except Exception as exc:
-        log(f"Source Kiddy123 failed: {exc}. Continuing.")
+    kiddy_rows = fetch_kiddy123()
+    all_records.extend(kiddy_rows)
+    source_counter += 1
 
-    try:
-        foursquare_rows = fetch_foursquare(session, centre_lat, centre_lng, radius_km)
-        all_records.extend(foursquare_rows)
-        source_counter += 1
-    except Exception as exc:
-        log(f"Source Foursquare failed: {exc}. Continuing.")
+    foursquare_rows = fetch_foursquare(centre_lat, centre_lng, radius_km)
+    all_records.extend(foursquare_rows)
+    source_counter += 1
 
-    try:
-        serp_rows = fetch_serpapi(session)
-        all_records.extend(serp_rows)
-        source_counter += 1
-    except Exception as exc:
-        log(f"Source SerpAPI failed: {exc}. Continuing.")
+    serp_rows = fetch_serpapi()
+    all_records.extend(serp_rows)
+    source_counter += 1
 
     enrich_with_moe_registry(all_records, moe_rows)
 
@@ -559,74 +503,14 @@ def run_pipeline(address: str, radius_km: float, output_csv: str) -> None:
     log(f"raw.csv written: {len(df)} rows from {source_counter} sources. {excluded} rows excluded.")
 
 
-def run_quick_check(address: str, radius_km: float) -> None:
-    """
-    Fast connectivity smoke-test for all configured sources.
-    This does not write CSV output; it only verifies source reachability and basic response handling.
-    """
-    session = build_session()
-    centre_lat, centre_lng, geocode_ok = geocode_address(address)
-    if geocode_ok:
-        log(f"[Quick Check] Resolved centre: {centre_lat:.4f}, {centre_lng:.4f}")
-    else:
-        log(f"[Quick Check] Geocoding fallback in use: {DEFAULT_LAT:.4f}, {DEFAULT_LNG:.4f}")
-
-    checks = {}
-
-    try:
-        overpass_rows = fetch_overpass(session, centre_lat, centre_lng, min(radius_km, 3))
-        checks["Overpass"] = f"OK ({len(overpass_rows)} rows)"
-    except Exception as exc:
-        checks["Overpass"] = f"FAIL ({exc})"
-
-    try:
-        gov_rows = fetch_data_gov_my(session)
-        checks["data.gov.my"] = f"OK ({len(gov_rows)} rows)"
-    except Exception as exc:
-        checks["data.gov.my"] = f"FAIL ({exc})"
-
-    try:
-        kiddy_rows = fetch_kiddy123(session)
-        checks["Kiddy123"] = f"OK ({len(kiddy_rows)} rows)"
-    except Exception as exc:
-        checks["Kiddy123"] = f"FAIL ({exc})"
-
-    try:
-        four_rows = fetch_foursquare(session, centre_lat, centre_lng, min(radius_km, 3))
-        checks["Foursquare"] = f"OK ({len(four_rows)} rows)"
-    except Exception as exc:
-        checks["Foursquare"] = f"FAIL ({exc})"
-
-    try:
-        serp_rows = fetch_serpapi(session)
-        checks["SerpAPI"] = f"OK ({len(serp_rows)} rows)"
-    except Exception as exc:
-        checks["SerpAPI"] = f"FAIL ({exc})"
-
-    log("\n[Quick Check] Source status summary:")
-    for source, status in checks.items():
-        log(f" - {source}: {status}")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Project Kestrel fetcher")
     parser.add_argument("--address", default=DEFAULT_ADDRESS, help="Search centre address")
     parser.add_argument("--radius", type=float, default=DEFAULT_RADIUS_KM, help="Search radius in km")
     parser.add_argument("--output", default="data/raw.csv", help="Output CSV path")
-    parser.add_argument(
-        "--quick-check",
-        "--quick_check",
-        "-q",
-        dest="quick_check",
-        action="store_true",
-        help="Run fast source connectivity checks only",
-    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.quick_check:
-        run_quick_check(address=args.address, radius_km=args.radius)
-    else:
-        run_pipeline(address=args.address, radius_km=args.radius, output_csv=args.output)
+    run_pipeline(address=args.address, radius_km=args.radius, output_csv=args.output)
