@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 from thefuzz import fuzz
+from tavily import TavilyClient
 
 load_dotenv()
 
@@ -97,6 +98,17 @@ NON_ECE_KEYWORDS = [
     "restaurant", "gym", "fitness", "salon", "bank", "insurance",
     "property", "real estate", "supermarket", "pharmacy",
 ]
+
+CURRICULUM_KEYWORDS = {
+    "Cambridge Early Years": ["cambridge", "cambs", "eyfs"],
+    "Montessori":            ["montessori", "practical life", "sensorial"],
+    "Play-based":            ["play-based", "playful", "child-led", "play based", "rumah main"],
+    "STEAM":                 ["steam", "coding", "robotics", "science technology"],
+    "Multiple Intelligences": ["multiple intelligences", "mi approach", "gardner"],
+    "Islamic-integrated":    ["islamic", "tahfiz", "hafazan", "jawi", "solat", "iqra", "quran"],
+    "KSPK":                  ["kspk", "kebangsaan", "national curriculum"],
+    "Holistic":              ["holistic", "whole child", "social-emotional"],
+}
 
 RAW_COLUMNS = [
     "centre_name", "address", "neighbourhood", "lat", "lng",
@@ -548,9 +560,109 @@ def fetch_foursquare(centre_lat: float, centre_lng: float, radius_km: float) -> 
     return out
 
 
-# ─────────────── Source 5: SerpAPI ────────────────────────────────
+# ─────────────── Source 5: Tavily Search [PRIMARY] ────────────────
 
-def fetch_serpapi() -> List[Dict]:
+def fetch_tavily() -> List[Dict]:
+    log("[Tavily] Fetching...")
+    out = []
+    key = os.getenv("TAVILY_KEY")
+    if not key:
+        log("TAVILY_KEY not found — skipping Tavily source")
+        return out
+
+    client = TavilyClient(api_key=key)
+
+    # Targeted queries — each one is one Tavily credit
+    # Keep under 20 queries total to stay within free tier (1000/month)
+    queries = [
+        "tadika Bukit Jelutong Shah Alam preschool",
+        "taska Bukit Jelutong Shah Alam childcare",
+        "preschool kindergarten Setia Alam Shah Alam fees",
+        "tadika taska Denai Alam Shah Alam",
+        "taska Elmina Shah Alam childcare centre",
+        "tadika Kota Elmina preschool fees",
+        "preschool kindergarten Elmina U16 Shah Alam",
+        "tadika taska Glenmarie Subang Bestari Shah Alam",
+        "Brainy Bunch Setia Alam location fees",
+        "REAL Kids Bukit Jelutong fees address",
+        "Little Caliphs Denai Alam Setia Alam fees",
+        "Genius Aulad Shah Alam Elmina fees",
+        "Knowledge Tree Montessori Eco Ardence fees",
+        "Choo Choo Train Setia Alam fees address",
+        "Tiny Tree House Elmina preschool fees",
+        "WYNKIDS preschool Setia Alam fees",
+    ]
+
+    for q in queries:
+        try:
+            # include_raw_content=True fetches actual page text — this is Tavily's key advantage
+            response = client.search(
+                query=q,
+                search_depth="advanced",
+                include_answer=False,
+                include_raw_content=True,
+                max_results=5,
+                include_domains=[],
+                exclude_domains=["youtube.com", "facebook.com"],
+            )
+
+            for result in response.get("results", []):
+                title   = safe_text(result.get("title", ""))
+                url     = safe_text(result.get("url", ""))
+                content = safe_text(result.get("content", ""))  # snippet
+                raw     = safe_text(result.get("raw_content", ""))  # full page text
+
+                # Use full page content if available, otherwise fall back to snippet
+                full_text = raw if raw else content
+
+                # Extract clean name
+                name = extract_clean_name_from_title(title)
+                if not is_valid_name(name):
+                    log(f"[Tavily] Rejected: '{name}'")
+                    continue
+
+                # Extract address from full page text (more reliable than snippet alone)
+                address = extract_clean_address_from_snippet(full_text)
+                if not address:
+                    address = extract_clean_address_from_snippet(content)
+
+                # Extract fees from full page text — Tavily gives us actual page content
+                fees = parse_fee_values(full_text)
+                fee_hd = fees[0] if fees else ""
+                fee_fd = fees[-1] if len(fees) > 1 else fees[0] if fees else ""
+
+                # Extract curriculum hints from full page text
+                curriculum_hint = ""
+                for label, kws in CURRICULUM_KEYWORDS.items():
+                    if any(kw in full_text.lower() for kw in kws):
+                        curriculum_hint = label
+                        break
+
+                rec = blank_record()
+                rec["centre_name"]      = name
+                rec["address"]          = address
+                rec["fee_halfday_raw"]  = fee_hd
+                rec["fee_fullday_raw"]  = fee_fd
+                rec["curriculum"]       = curriculum_hint
+                rec["source_primary"]   = "Tavily Search"
+                rec["source_notes"]     = (
+                    f"[Verified: Tavily Search — {url[:60]}]"
+                    + (" Fees from website." if fees else "")
+                )
+                out.append(rec)
+
+        except Exception as exc:
+            log(f"Source Tavily failed ('{q[:40]}'): {exc}. Continuing.")
+
+    log(f"[Tavily] Collected {len(out)} rows before filter")
+    out = [r for r in out if is_valid_name(r.get("centre_name", ""))]
+    log(f"[Tavily] {len(out)} rows after name filter")
+    return out
+
+
+# ─────────────── Source 6: SerpAPI [FALLBACK] ─────────────────────
+
+def fetch_serpapi_fallback() -> List[Dict]:
     """
     Searches Google via SerpAPI. Strict post-processing:
     - Extracts operator name cleanly from page title
@@ -725,10 +837,20 @@ def run_pipeline(address: str, radius_km: float, output_csv: str) -> None:
     if foursquare_rows:
         sources_used.append("Foursquare")
 
-    serp_rows = fetch_serpapi()
-    all_records.extend(serp_rows)
-    if serp_rows:
-        sources_used.append("SerpAPI")
+    tavily_rows = fetch_tavily()
+    all_records.extend(tavily_rows)
+    if tavily_rows:
+        sources_used.append("Tavily Search")
+
+    # Only call SerpAPI if Tavily found very few results
+    if len(tavily_rows) < 15:
+        log(f"Tavily returned only {len(tavily_rows)} results — running SerpAPI fallback")
+        serp_rows = fetch_serpapi_fallback()
+        all_records.extend(serp_rows)
+        if serp_rows:
+            sources_used.append("SerpAPI (fallback)")
+    else:
+        log(f"Tavily returned {len(tavily_rows)} results — skipping SerpAPI to conserve quota")
 
     log(f"\nTotal collected before dedup: {len(all_records)} rows")
 
@@ -762,3 +884,4 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     run_pipeline(address=args.address, radius_km=args.radius, output_csv=args.output)
+    
