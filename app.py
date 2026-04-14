@@ -663,23 +663,34 @@ def render_tab3(df_comp: pd.DataFrame):
     islamic_pct = 100 * (df_comp[religious_col].astype(str).str.contains('islamic', case=False).sum() / total)
     secular_pct = 100 * (df_comp[religious_col].astype(str).str.contains('secular|international', case=False).sum() / total)
 
-    fee_num = df_comp["fee_fullday_raw"].astype(str).map(parse_fee_value)
-    avg_all = fee_num[fee_num > 0].mean() if (fee_num > 0).any() else 0
+    # Handle both old and new fee column naming
+    fee_col = "fee_fullday_raw" if "fee_fullday_raw" in df_comp.columns else "fee_fullday" if "fee_fullday" in df_comp.columns else None
 
-    def avg_area(area):
-        vals = df_comp[df_comp["neighbourhood"].astype(str).str.contains(area, case=False, na=False)]["fee_fullday_raw"].astype(str).map(parse_fee_value)
-        vals = vals[vals > 0]
-        return vals.mean() if not vals.empty else 0
+    if fee_col:
+        fee_num = df_comp[fee_col].astype(str).map(parse_fee_value)
+        avg_all = fee_num[fee_num > 0].mean() if (fee_num > 0).any() else 0
 
-    avg_bj = avg_area("Bukit Jelutong")
-    avg_sa = avg_area("Setia Alam")
-    avg_el = avg_area("Elmina")
+        def avg_area(area):
+            vals = df_comp[df_comp["neighbourhood"].astype(str).str.contains(area, case=False, na=False)][fee_col].astype(str).map(parse_fee_value)
+            vals = vals[vals > 0]
+            return vals.mean() if not vals.empty else 0
 
-    premium_gap = TARGET_B_FEE - fee_num[fee_num > 0].max() if (fee_num > 0).any() else TARGET_B_FEE
+        avg_bj = avg_area("Bukit Jelutong")
+        avg_sa = avg_area("Setia Alam")
+        avg_el = avg_area("Elmina")
+
+        premium_gap = TARGET_B_FEE - fee_num[fee_num > 0].max() if (fee_num > 0).any() else TARGET_B_FEE
+    else:
+        avg_all = 0
+        avg_bj = 0
+        avg_sa = 0
+        avg_el = 0
+        premium_gap = TARGET_B_FEE
 
     dens = df_comp["neighbourhood"].value_counts()
     lowest_density = dens.idxmin() if not dens.empty else "N/A"
     highest_density = dens.idxmax() if not dens.empty else "N/A"
+    elmina_count = dens.get("Elmina", 0)
 
     # Fix scale column names
     scale_col = 'scale'
