@@ -61,15 +61,148 @@ def geocode_address(address: str):
     return None, None, "Address not found"
 
 
+def _coalesce_str(series: pd.Series) -> pd.Series:
+    """Return the series with NaN / 'nan' / whitespace-only values replaced by ''."""
+    return series.fillna("").astype(str).str.strip().replace("nan", "")
+
+
+def _deduplicate_master(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge rows that share the same centre_name (case-insensitive, stripped).
+
+    For every column, the first non-blank value across sibling rows wins.
+    This collapses duplicate entries that differ only in which fields are blank.
+    """
+    if df.empty or "centre_name" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["_dedup_key"] = df["centre_name"].fillna("").astype(str).str.strip().str.lower()
+
+    def _merge_group(group: pd.DataFrame) -> pd.Series:
+        if len(group) == 1:
+            return group.iloc[0]
+        merged = {}
+        for col in group.columns:
+            non_blank = (
+                group[col]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .replace("nan", "")
+            )
+            non_blank = non_blank[non_blank != ""]
+            merged[col] = non_blank.iloc[0] if not non_blank.empty else ""
+        return pd.Series(merged)
+
+    deduped = (
+        df.groupby("_dedup_key", sort=False, group_keys=False)
+        .apply(_merge_group)
+        .reset_index(drop=True)
+    )
+    return deduped.drop(columns=["_dedup_key"], errors="ignore")
+
+
 @st.cache_data
 def load_data() -> pd.DataFrame:
     if not os.path.exists(MASTER_PATH):
         return pd.DataFrame()
+
     df = pd.read_csv(MASTER_PATH)
+
+    # ── Schema normalisation ──────────────────────────────────────────────────
+    # The new enricher.py dropped several columns present in the old schema.
+    # Map equivalents and fill missing columns with safe defaults so the rest
+    # of the app never needs to know which enricher version produced the file.
+
+    # verification_note (new enricher) → source_notes (what the app expects)
+    if "source_notes" not in df.columns:
+        if "verification_note" in df.columns:
+            df["source_notes"] = df["verification_note"]
+        else:
+            df["source_notes"] = ""
+
+    # Columns absent from the new enricher — add empty defaults
+    _defaults: dict = {
+        "fee_halfday_raw":   "",
+        "fee_fullday_raw":   "",
+        "source_primary":    "",
+        "is_moe_registered": False,
+        "threat_score":      "",
+        "lat":               "",
+        "lng":               "",
+    }
+    for col, default in _defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    # ── fee_display ───────────────────────────────────────────────────────────
     if "fee_display" not in df.columns:
-        df["fee_display"] = df["fee_halfday_raw"].astype(str) + " | " + df["fee_fullday_raw"].astype(str)
-    if "threat_score" not in df.columns:
-        df["threat_score"] = ""
+        half = _coalesce_str(df["fee_halfday_raw"])
+        full = _coalesce_str(df["fee_fullday_raw"])
+        df["fee_display"] = half.where(half != "", "").str.cat(
+            full.where(full != "", ""),
+            sep=" | ",
+            na_rep="",
+        ).str.strip(" |").str.strip()
+
+    # ── Deduplication ─────────────────────────────────────────────────────────
+    # Merge rows of the same ECE that differ only in which fields are blank.
+    df = _deduplicate_master(df)
+    
+    # ── Calculate Threat Scores ───────────────────────────────────────────────
+    # Calculate threat scores for all centers that don't have them
+    if 'threat_score' in df.columns:
+        df['threat_score'] = df.apply(
+            lambda row: calculate_threat_score(row) if str(row.get('threat_score', '')).strip() == '' or str(row.get('threat_score', '')).strip() == 'Reference'
+            else float(row.get('threat_score', 0)), axis=1
+        )
+    else:
+        df['threat_score'] = df.apply(calculate_threat_score, axis=1)
+    
+    # Round threat scores to integers for display
+    df['threat_score'] = df['threat_score'].round(0).astype(int)
+    
+    # ── Extract Coordinates from Geocode Data ───────────────────────────────────
+    # Extract lat/lng from geocode_data if lat/lng columns are missing or empty
+    if 'geocode_data' in df.columns:
+        def extract_coordinates(row):
+            # Skip if lat/lng already exist and are valid
+            if pd.notna(row.get('lat')) and pd.notna(row.get('lng')):
+                try:
+                    lat = float(row['lat'])
+                    lng = float(row['lng'])
+                    if lat != 0.0 and lng != 0.0:
+                        return row['lat'], row['lng']
+                except (ValueError, TypeError):
+                    pass
+            
+            # Try to extract from geocode_data
+            geocode_data = row.get('geocode_data', '')
+            if not geocode_data or str(geocode_data) == 'nan':
+                return None, None
+                
+            try:
+                # Handle different geocode_data formats
+                if isinstance(geocode_data, str):
+                    import json
+                    geocode_dict = json.loads(geocode_data)
+                    coords = geocode_dict.get('coordinates')
+                    if coords and len(coords) == 2:
+                        return float(coords[0]), float(coords[1])
+                elif hasattr(geocode_data, 'get'):
+                    coords = geocode_data.get('coordinates')
+                    if coords and len(coords) == 2:
+                        return float(coords[0]), float(coords[1])
+            except (ValueError, TypeError, json.JSONDecodeError, AttributeError):
+                pass
+                
+            return None, None
+        
+        # Apply coordinate extraction
+        coordinates = df.apply(extract_coordinates, axis=1, result_type='expand')
+        df['lat'] = coordinates[0]
+        df['lng'] = coordinates[1]
+
     return df
 
 
@@ -197,6 +330,51 @@ def build_word_copy_text(df_export: pd.DataFrame) -> str:
     return "\n".join(["\t".join(df_export.columns)] + ["\t".join(map(str, row)) for row in df_export.values])
 
 
+def calculate_threat_score(row: pd.Series) -> float:
+    """
+    Calculate threat score based on 5-factor rubric (0-10 scale).
+    """
+    score = 0.0
+    
+    # 1. Curriculum overlap (0-3 pts)
+    curriculum = str(row.get('curriculum', '')).lower()
+    if any(term in curriculum for term in ['cambridge', 'eyfs', 'british']):
+        score += 3
+    elif any(term in curriculum for term in ['islamic', 'kspk', 'moe']):
+        score += 2
+    elif any(term in curriculum for term in ['montessori', 'play-based', 'reggio']):
+        score += 1
+    
+    # 2. Religious orientation (0-2 pts)
+    religious = str(row.get('religious_orientation', '')).lower()
+    if any(term in religious for term in ['islamic', 'muslim']):
+        score += 2
+    elif any(term in religious for term in ['international', 'bilingual']):
+        score += 1
+    
+    # 3. Scale/reach (0-2 pts)
+    scale = str(row.get('scale', '')).lower()
+    if any(term in scale for term in ['national', 'chain', 'franchise']):
+        score += 2
+    elif any(term in scale for term in ['regional', 'multiple']):
+        score += 1
+    
+    # 4. Fee band overlap (0-2 pts)
+    fee_text = str(row.get('fee_fullday_raw', '')).lower()
+    fee = parse_fee_value(fee_text)
+    if 940 <= fee <= 1410:  # Brand B band
+        score += 2
+    elif 300 <= fee <= 700:  # Brand A band
+        score += 1
+    
+    # 5. Neighbourhood proximity (0-1 pt)
+    neighbourhood = str(row.get('neighbourhood', '')).lower()
+    if 'bukit jelutong' in neighbourhood:
+        score += 1
+    
+    return min(score, 10.0)  # Cap at 10
+
+
 def make_threat_tier(score) -> str:
     try:
         score = float(score)
@@ -243,7 +421,7 @@ def render_tab1(df_targets: pd.DataFrame, df_competitors: pd.DataFrame):
     cols = [c for c in ["centre_name", "address", "neighbourhood", "curriculum", "language_medium", "fee_display", "scale", "religious_orientation", "source_notes", "threat_score", "Threat Tier"] if c in display.columns]
     display = display[cols].rename(columns=DISPLAY_COLUMNS_MAP)
 
-    st.dataframe(style_comp_table(display), use_container_width=True, height=500)
+    st.dataframe(style_comp_table(display), width="stretch", height=500)
 
     csv_data = display.to_csv(index=False).encode("utf-8")
     excel_data = table_to_excel(display)
@@ -268,69 +446,144 @@ def render_tab2(df_all: pd.DataFrame, radius_km: int, lat: float, lng: float):
         dash_array="8,6",
     ).add_to(m)
 
-    show_islamic = st.checkbox("Show Islamic operators", value=True)
-    show_premium = st.checkbox("Show Premium operators", value=True)
-    show_secular = st.checkbox("Show Secular / other operators", value=True)
+    show_high_threat = st.checkbox("🔴 High Threat (8-10)", value=True)
+    show_medium_threat = st.checkbox("🟡 Medium Threat (5-7)", value=True)
+    show_low_threat = st.checkbox("🟢 Low Threat (1-4)", value=True)
     show_targets = st.checkbox("Show Target reference pins", value=True)
 
     layer_targets = folium.FeatureGroup(name="Target")
-    layer_islamic = folium.FeatureGroup(name="Islamic")
-    layer_premium = folium.FeatureGroup(name="Premium")
-    layer_secular = folium.FeatureGroup(name="Secular/Other")
+    layer_high = folium.FeatureGroup(name="High Threat")
+    layer_medium = folium.FeatureGroup(name="Medium Threat")
+    layer_low = folium.FeatureGroup(name="Low Threat")
 
     cluster = MarkerCluster(name="Clusters")
+    
+    # Debug: Check coordinate availability
+    has_lat = 'lat' in df_all.columns
+    has_lng = 'lng' in df_all.columns
+    has_geocode = 'geocode_data' in df_all.columns
+    
+    st.write(f"Debug: Data has lat: {has_lat}, lng: {has_lng}, geocode_data: {has_geocode}")
+    st.write(f"Debug: Total rows: {len(df_all)}")
+    
+    markers_added = 0
+    coordinates_extracted = 0
 
     for _, row in df_all.iterrows():
-        if pd.isna(row.get("lat")) or pd.isna(row.get("lng")):
+        lat_val, lng_val = None, None
+        
+        # Try to get coordinates from lat/lng columns first
+        try:
+            lat_val = float(row.get("lat", ""))
+            lng_val = float(row.get("lng", ""))
+            if lat_val and lng_val and not (lat_val == 0.0 and lng_val == 0.0):
+                coordinates_extracted += 1
+        except (ValueError, TypeError):
+            pass
+        
+        # If lat/lng failed, try to extract from geocode_data
+        if not lat_val or not lng_val:
+            geocode_data = row.get('geocode_data', '')
+            if geocode_data and str(geocode_data) != 'nan':
+                try:
+                    # Handle different geocode_data formats
+                    if isinstance(geocode_data, str):
+                        # Try to parse as JSON
+                        import json
+                        geocode_dict = json.loads(geocode_data)
+                        coords = geocode_dict.get('coordinates')
+                        if coords and len(coords) == 2:
+                            lat_val, lng_val = float(coords[0]), float(coords[1])
+                            coordinates_extracted += 1
+                    elif hasattr(geocode_data, 'get'):
+                        # If it's already a dict-like object
+                        coords = geocode_data.get('coordinates')
+                        if coords and len(coords) == 2:
+                            lat_val, lng_val = float(coords[0]), float(coords[1])
+                            coordinates_extracted += 1
+                except (ValueError, TypeError, json.JSONDecodeError, AttributeError):
+                    pass
+        
+        # Skip if still no valid coordinates or if values are NaN
+        if not lat_val or not lng_val or pd.isna(lat_val) or pd.isna(lng_val):
             continue
 
         is_target = "Reference — Target" in str(row.get("source_notes", ""))
+        
+        # Get threat score and round to integer
+        threat_score = 0
+        try:
+            threat_score = int(round(float(row.get("threat_score", 0))))
+        except (ValueError, TypeError):
+            threat_score = 0
+        
         popup = (
             f"<b>{row.get('centre_name', '')}</b><br>"
             f"Neighbourhood: {row.get('neighbourhood', '')}<br>"
             f"Scale: {row.get('scale', '')}<br>"
             f"Full-day fee: {row.get('fee_fullday_raw', '')}<br>"
-            f"Curriculum: {row.get('curriculum', '')}"
+            f"Curriculum: {row.get('curriculum', '')}<br>"
+            f"<b>Threat Score: {threat_score}/10</b>"
         )
 
         if is_target and show_targets:
             folium.Marker(
-                [row["lat"], row["lng"]],
+                [lat_val, lng_val],
                 popup=popup,
                 icon=folium.Icon(color="orange", icon="star"),
             ).add_to(layer_targets)
+            markers_added += 1
             continue
 
-        orientation = str(row.get("religious_orientation", ""))
-        scale = str(row.get("scale", ""))
+        # Color based on threat score
+        if threat_score >= 8 and show_high_threat:
+            folium.Marker(
+                [lat_val, lng_val], 
+                popup=popup, 
+                icon=folium.Icon(color="red", icon="exclamation-triangle")
+            ).add_to(layer_high)
+            markers_added += 1
+        elif 5 <= threat_score <= 7 and show_medium_threat:
+            folium.Marker(
+                [lat_val, lng_val], 
+                popup=popup, 
+                icon=folium.Icon(color="orange", icon="warning")
+            ).add_to(layer_medium)
+            markers_added += 1
+        elif 1 <= threat_score <= 4 and show_low_threat:
+            folium.Marker(
+                [lat_val, lng_val], 
+                popup=popup, 
+                icon=folium.Icon(color="green", icon="info-sign")
+            ).add_to(layer_low)
+            markers_added += 1
 
-        if orientation == "Islamic-integrated" and show_islamic:
-            folium.Marker([row["lat"], row["lng"]], popup=popup, icon=folium.Icon(color="green")).add_to(layer_islamic)
-        elif scale == "Institutional Campus" and show_premium:
-            folium.Marker([row["lat"], row["lng"]], popup=popup, icon=folium.Icon(color="red")).add_to(layer_premium)
-        elif show_secular:
-            folium.Marker([row["lat"], row["lng"]], popup=popup, icon=folium.Icon(color="blue")).add_to(layer_secular)
+        # Add to cluster
+        folium.Marker([lat_val, lng_val], popup=popup).add_to(cluster)
+        markers_added += 1
+    
+    st.write(f"Debug: Coordinates extracted: {coordinates_extracted}, Markers added: {markers_added}")
 
-        folium.Marker([row["lat"], row["lng"]], popup=popup).add_to(cluster)
-
+    # Add layers to map
     if show_targets:
         layer_targets.add_to(m)
-    if show_islamic:
-        layer_islamic.add_to(m)
-    if show_premium:
-        layer_premium.add_to(m)
-    if show_secular:
-        layer_secular.add_to(m)
+    if show_high_threat:
+        layer_high.add_to(m)
+    if show_medium_threat:
+        layer_medium.add_to(m)
+    if show_low_threat:
+        layer_low.add_to(m)
 
     cluster.add_to(m)
 
     legend_html = """
-    <div style='position: fixed; bottom: 40px; left: 40px; z-index: 9999; background-color: white; padding: 10px; border: 1px solid #ccc;'>
-      <b>Legend</b><br>
-      <span style='color:orange;'>●</span> Target<br>
-      <span style='color:green;'>●</span> Islamic-integrated<br>
-      <span style='color:red;'>●</span> Premium / Institutional<br>
-      <span style='color:blue;'>●</span> Secular / Other
+    <div style='position: fixed; bottom: 40px; left: 40px; z-index: 9999; background-color: white; padding: 10px; border: 1px solid #ccc; color: black;'>
+      <b>Threat Map Legend</b><br>
+      <span style='color:orange;'>★</span> Target Reference<br>
+      <span style='color:red;'>▲</span> High Threat (8-10)<br>
+      <span style='color:orange;'>▲</span> Medium Threat (5-7)<br>
+      <span style='color:green;'>▲</span> Low Threat (1-4)<br>
+      <small>Icons show threat level based on 5-factor rubric</small>
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -352,14 +605,20 @@ def render_tab3(df_comp: pd.DataFrame):
         return
 
     total = len(df_comp)
-    islamic_pct = 100 * (df_comp["religious_orientation"].astype(str).eq("Islamic-integrated").sum() / total)
-    secular_pct = 100 * (df_comp["religious_orientation"].astype(str).eq("Secular").sum() / total)
+    
+    # Fix religious orientation column names
+    religious_col = 'religious_orientation'
+    if religious_col not in df_comp.columns:
+        religious_col = 'religious_orientation'  # fallback
+    
+    islamic_pct = 100 * (df_comp[religious_col].astype(str).str.contains('islamic', case=False).sum() / total)
+    secular_pct = 100 * (df_comp[religious_col].astype(str).str.contains('secular|international', case=False).sum() / total)
 
     fee_num = df_comp["fee_fullday_raw"].astype(str).map(parse_fee_value)
     avg_all = fee_num[fee_num > 0].mean() if (fee_num > 0).any() else 0
 
     def avg_area(area):
-        vals = df_comp[df_comp["neighbourhood"] == area]["fee_fullday_raw"].astype(str).map(parse_fee_value)
+        vals = df_comp[df_comp["neighbourhood"].astype(str).str.contains(area, case=False, na=False)]["fee_fullday_raw"].astype(str).map(parse_fee_value)
         vals = vals[vals > 0]
         return vals.mean() if not vals.empty else 0
 
@@ -373,21 +632,53 @@ def render_tab3(df_comp: pd.DataFrame):
     lowest_density = dens.idxmin() if not dens.empty else "N/A"
     highest_density = dens.idxmax() if not dens.empty else "N/A"
 
-    national_chains = df_comp["scale"].astype(str).eq("National Chain").sum()
-    independent_ops = df_comp["scale"].astype(str).eq("Independent").sum()
-    elmina_count = int((df_comp["neighbourhood"] == "Elmina").sum())
+    # Fix scale column names
+    scale_col = 'scale'
+    if scale_col not in df_comp.columns:
+        scale_col = 'scale'
+    
+    national_chains = df_comp[scale_col].astype(str).str.contains('national|chain', case=False).sum()
+    independent_ops = df_comp[scale_col].astype(str).str.contains('independent|single', case=False).sum()
+    elmina_count = int((df_comp["neighbourhood"].astype(str).str.contains("Elmina", case=False)).sum())
 
-    verified_rows = df_comp["source_notes"].astype(str).str.contains("\[Verified", regex=True).sum()
-    inferred_rows = df_comp["source_notes"].astype(str).str.contains("\[Inferred", regex=True).sum()
+    # Fix source column names
+    source_col = 'source_notes'
+    if source_col not in df_comp.columns:
+        source_col = 'verification_note'
+    
+    verified_rows = df_comp[source_col].astype(str).str.contains(r"\[Verified|Verified", case=False, regex=True).sum()
+    inferred_rows = df_comp[source_col].astype(str).str.contains(r"\[Inferred|Inferred", case=False, regex=True).sum()
+
+    # Get threat score statistics
+    high_threat = df_comp['threat_score'].astype(float).ge(8).sum()
+    medium_threat = df_comp['threat_score'].astype(float).between(5, 7).sum()
+    low_threat = df_comp['threat_score'].astype(float).lt(5).sum()
+
+    # Get top threats
+    top_threats = df_comp.nlargest(3, 'threat_score')[['centre_name', 'address', 'threat_score']].to_string(index=False)
 
     source_labels = {
         "Overpass API (OpenStreetMap)",
-        "data.gov.my Open API",
+        "data.gov.my Open API", 
         "Kiddy123 Directory",
         "Foursquare Places API",
         "SerpAPI (Google Search)",
+        "Tavily",
+        "ArcGIS",
+        "TomTom"
     }
-    found_sources = sorted(source_labels.intersection(set(df_comp["source_primary"].dropna().astype(str).tolist())))
+    
+    # Extract sources from source_notes
+    all_sources = []
+    for notes in df_comp[source_col].dropna().astype(str):
+        if "Tavily" in notes:
+            all_sources.append("Tavily")
+        if "ArcGIS" in notes:
+            all_sources.append("ArcGIS")
+        if "TomTom" in notes:
+            all_sources.append("TomTom")
+    
+    found_sources = sorted(set(all_sources))
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total competitors", total)
@@ -402,17 +693,22 @@ def render_tab3(df_comp: pd.DataFrame):
     c1, c2, c3 = st.columns(3)
     c1.metric("Premium fee gap (Target B vs nearest rival)", f"RM {premium_gap:,.0f}")
     c2.metric("Lowest-density area", lowest_density)
-    c3.metric("Verified vs Inferred split", f"{verified_rows} vs {inferred_rows}")
+    c3.metric("Verified vs Inferred", f"{verified_rows} vs {inferred_rows}")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("National chains", int(national_chains))
     c2.metric("Independent operators", int(independent_ops))
     c3.metric("Elmina operator count", elmina_count)
 
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🔴 High threats", int(high_threat))
+    c2.metric("🟡 Medium threats", int(medium_threat))
+    c3.metric("🟢 Low threats", int(low_threat))
+
     if elmina_count < 3:
         st.warning("⚠️ Elmina coverage may be incomplete. Recommend supplementing with manual Google Maps / Facebook search for 'taska Kota Elmina' and 'tadika Elmina Shah Alam'.")
 
-    st.info(f"Data drawn from {len(found_sources)} of 5 sources: {', '.join(found_sources) if found_sources else 'None'}")
+    st.info(f"Data drawn from {len(found_sources)} sources: {', '.join(found_sources) if found_sources else 'None'}")
 
     chart_df = (
         df_comp.assign(_fee=df_comp["fee_fullday_raw"].astype(str).map(parse_fee_value))
@@ -423,7 +719,38 @@ def render_tab3(df_comp: pd.DataFrame):
     if not chart_df.empty:
         fig = px.bar(chart_df, x="neighbourhood", y="_fee", title="Average Full-Day Fee by Neighbourhood")
         fig.add_hline(y=TARGET_B_FEE, line_dash="dash", annotation_text="Target Brand B")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
+
+    # Auto-fill insights based on actual data
+    auto_insight_a = f"Found {total} ECE operators across Shah Alam corridor. "
+    if highest_density != "N/A":
+        auto_insight_a += f"Highest concentration in {highest_density} ({dens[highest_density]} operators). "
+    if lowest_density != "N/A":
+        auto_insight_a += f"Lowest density in {lowest_density} ({dens[lowest_density]} operators). "
+    auto_insight_a += f"Average monthly fees RM{avg_all:,.0f}, ranging from RM{fee_num.min():,.0f} to RM{fee_num.max():,.0f}."
+
+    auto_insight_b = f"Top threats identified: {high_threat} high-threat operators. "
+    if high_threat > 0:
+        auto_insight_b += f"Key competitors:\n{top_threats}\n"
+    if premium_gap > 0:
+        auto_insight_b += f"Target Brand B commands RM{premium_gap:,.0f} premium above nearest competitor. "
+    else:
+        auto_insight_b += "Target Brand B pricing is competitive with market leaders. "
+
+    auto_insight_c = f"Religious orientation split: {islamic_pct:.1f}% Islamic vs {secular_pct:.1f}% secular. "
+    if elmina_count < 3:
+        auto_insight_c += f"Elmina market appears underserved with only {elmina_count} operators. "
+    if national_chains > independent_ops:
+        auto_insight_c += f"Market dominated by national chains ({national_chains} vs {independent_ops} independents)."
+
+    auto_insight_d = "Overall market appears "
+    if high_threat > total * 0.3:
+        auto_insight_d += "highly competitive with strong established players. "
+    elif medium_threat > total * 0.5:
+        auto_insight_d += "moderately competitive with room for differentiation. "
+    else:
+        auto_insight_d += "fragmented with opportunities for premium positioning. "
+    auto_insight_d += f"Brand B should target {highest_density} area for maximum impact."
 
     st.warning(
         "⚠️ This is a draft framework only. The statistics above are auto-filled. "
@@ -433,16 +760,22 @@ def render_tab3(df_comp: pd.DataFrame):
 
     author_name = st.text_input("From:", value="[Your Name]")
 
-    sec_a = st.text_area("a) What did you find?", value="Prompt: quantify total operators, cluster patterns, and saturation by area.")
-    sec_b = st.text_area("b) Biggest threats to the Target", value="Prompt: identify 2–3 specific operators and explain why each is a threat to Brand A or Brand B.")
-    sec_c = st.text_area("c) Anything surprising?", value="Prompt: highlight one unexpected insight (e.g., Elmina gap, unusual pricing, hidden competitor).")
-    sec_d = st.text_area("d) Overall read", value="Prompt: give a direct verdict — manageable or daunting, and for which brand.")
+    sec_a = st.text_area("a) What did you find?", value=auto_insight_a, height=100)
+    sec_b = st.text_area("b) Biggest threats to the Target", value=auto_insight_b, height=100)
+    sec_c = st.text_area("c) Anything surprising?", value=auto_insight_c, height=100)
+    sec_d = st.text_area("d) Overall read", value=auto_insight_d, height=100)
 
     memo = f"""MEMORANDUM
 To:    The Team, Newmoon Capital
 From:  {author_name}
 Re:    Project Kestrel — Competitive Landscape, Shah Alam ECE Corridor
 Date:  {date.today().isoformat()}
+
+EXECUTIVE SUMMARY
+• Total ECE operators analyzed: {total}
+• High-threat competitors: {high_threat} | Medium-threat: {medium_threat} | Low-threat: {low_threat}
+• Average market fees: RM{avg_all:,.0f}/month vs Target Brand B: RM{TARGET_B_FEE:,.0f}/month
+• Market concentration: {highest_density} ({dens[highest_density]} operators) to {lowest_density} ({dens[lowest_density]} operators)
 
 a) What did you find?
 {sec_a}
@@ -455,10 +788,15 @@ c) Anything surprising?
 
 d) Overall read
 {sec_d}
+
+---
+Generated by Project Kestrel ECE Intelligence System
+Data sources: {', '.join(found_sources) if found_sources else 'None'}
+Last updated: {date.today().isoformat()}
 """
 
-    st.code(memo)
-    st.download_button("Download memo as .txt", data=memo.encode("utf-8"), file_name="memo_draft.txt", mime="text/plain")
+    st.code(memo, language="text")
+    st.download_button("📄 Download memo as .txt", data=memo.encode("utf-8"), file_name=f"kestrel_memo_{date.today().strftime('%Y%m%d')}.txt", mime="text/plain")
 
 
 def render_tab4(df_all: pd.DataFrame):
@@ -477,8 +815,10 @@ def render_tab4(df_all: pd.DataFrame):
             if any(not str(v).strip() for v in new_data.values()):
                 st.error("All fields are required.")
             else:
-                row = {**new_data, "source_primary": "Manual Entry", "is_moe_registered": False, "threat_score": "", "lat": "", "lng": ""}
+                row = {**new_data, "source_primary": "Manual Entry", "is_moe_registered": False, "lat": "", "lng": ""}
+                # Calculate threat score for new entry
                 df_new = pd.concat([df_all, pd.DataFrame([row])], ignore_index=True)
+                df_new['threat_score'] = df_new.apply(calculate_threat_score, axis=1)
                 save_data(df_new)
                 st.success("Operator added.")
                 st.rerun()
@@ -526,13 +866,14 @@ def render_tab4(df_all: pd.DataFrame):
             st.error(f"Missing required headers: {', '.join(missing)}")
         else:
             up_df = up_df.drop_duplicates(subset=["centre_name", "address"], keep="first")
-            st.dataframe(up_df.head(30), use_container_width=True)
+            st.dataframe(up_df.head(30), width="stretch")
             if st.button("Confirm import"):
                 up_df["source_primary"] = "Manual Entry"
                 up_df["is_moe_registered"] = False
-                up_df["threat_score"] = ""
                 up_df["lat"] = ""
                 up_df["lng"] = ""
+                # Calculate threat scores for imported data
+                up_df['threat_score'] = up_df.apply(calculate_threat_score, axis=1)
                 combined = pd.concat([df_all, up_df], ignore_index=True)
                 combined = combined.drop_duplicates(subset=["centre_name", "address"], keep="first")
                 save_data(combined)
@@ -542,6 +883,16 @@ def render_tab4(df_all: pd.DataFrame):
 
 def main():
     st.title("Project Kestrel — ECE Market Intelligence Dashboard")
+
+    # Refresh data button
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔄 Refresh Data", help="Reload data from master.csv"):
+            st.cache_data.clear()
+            st.rerun()
+    
+    with col2:
+        st.markdown("**Real-time ECE Competitive Intelligence**")
 
     if "last_valid_lat" not in st.session_state:
         st.session_state["last_valid_lat"] = DEFAULT_LAT

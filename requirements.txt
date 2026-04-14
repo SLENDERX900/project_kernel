@@ -1,13 +1,37 @@
-streamlit
-pandas
-openpyxl
-requests
-beautifulsoup4
-folium
-streamlit-folium
-geopy
-python-dotenv
-thefuzz
-python-Levenshtein
-xlsxwriter
-plotly
+# Core dependencies
+streamlit>=1.28
+pandas>=2.0
+numpy>=1.24
+
+# Data processing
+openpyxl>=3.1
+xlsxwriter>=3.1
+
+# Web scraping & APIs
+requests>=2.31
+beautifulsoup4>=4.12
+tavily-python>=0.3
+ddgs>=7.0  # Free search API (renamed from duckduckgo-search)
+
+# Visualization
+folium>=0.14
+streamlit-folium>=0.15.0
+plotly>=5.18
+
+# Geospatial
+geopy>=2.4
+shapely>=2.0  # For polygon operations
+
+# Text matching
+thefuzz>=0.20
+python-Levenshtein>=0.23
+
+# NLP for NER gatekeeper
+spacy>=3.7
+
+# Environment
+python-dotenv>=1.0
+
+# Testing
+pytest>=7.4
+pytest-asyncio>=0.21 
