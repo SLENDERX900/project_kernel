@@ -430,6 +430,15 @@ def render_tab1(df_targets: pd.DataFrame, df_competitors: pd.DataFrame):
 
     st.markdown(f"**Showing {len(df_competitors)} competitors | {len(df_targets)} Target reference rows (always shown)**")
 
+    # Align columns before concatenation to handle schema differences
+    df_targets = df_targets.copy()
+    df_competitors = df_competitors.copy()
+    all_cols = set(df_targets.columns) | set(df_competitors.columns)
+    for col in all_cols:
+        if col not in df_targets.columns:
+            df_targets[col] = ""
+        if col not in df_competitors.columns:
+            df_competitors[col] = ""
     display = pd.concat([df_targets, df_competitors], ignore_index=True)
 
     cols = [c for c in ["centre_name", "brand", "address", "neighbourhood", "curriculum", "religious_orientation", "language_medium", "scale", "fee_halfday", "fee_fullday", "verification_note"] if c in display.columns]
@@ -666,6 +675,13 @@ def render_tab3(df_comp: pd.DataFrame):
     # Handle both old and new fee column naming
     fee_col = "fee_fullday_raw" if "fee_fullday_raw" in df_comp.columns else "fee_fullday" if "fee_fullday" in df_comp.columns else None
 
+    # Initialize premium_gap and area averages with default values
+    premium_gap = TARGET_B_FEE
+    avg_all = 0
+    avg_bj = 0
+    avg_sa = 0
+    avg_el = 0
+
     if fee_col:
         fee_num = df_comp[fee_col].astype(str).map(parse_fee_value)
         avg_all = fee_num[fee_num > 0].mean() if (fee_num > 0).any() else 0
@@ -735,14 +751,14 @@ def render_tab3(df_comp: pd.DataFrame):
     
     # Extract sources from source_notes
     all_sources = []
-    for notes in df_comp[source_col].dropna().astype(str):
-        if "Tavily" in notes:
-            all_sources.append("Tavily")
-        if "ArcGIS" in notes:
-            all_sources.append("ArcGIS")
-        if "TomTom" in notes:
-            all_sources.append("TomTom")
-    
+    if source_col:
+        for notes in df_comp[source_col].dropna().astype(str):
+            if "Tavily" in notes:
+                all_sources.append("Tavily")
+            if "ArcGIS" in notes:
+                all_sources.append("ArcGIS")
+            if "TomTom" in notes:
+                all_sources.append("TomTom")
     found_sources = sorted(set(all_sources))
 
     c1, c2, c3 = st.columns(3)
@@ -1043,7 +1059,16 @@ def main():
         render_tab1(df_targets, df_competitors)
 
     with t2:
-        map_df = pd.concat([df_targets, df_competitors], ignore_index=True)
+        # Align columns before concatenation to handle schema differences
+        df_targets_copy = df_targets.copy()
+        df_competitors_copy = df_competitors.copy()
+        all_cols = set(df_targets_copy.columns) | set(df_competitors_copy.columns)
+        for col in all_cols:
+            if col not in df_targets_copy.columns:
+                df_targets_copy[col] = ""
+            if col not in df_competitors_copy.columns:
+                df_competitors_copy[col] = ""
+        map_df = pd.concat([df_targets_copy, df_competitors_copy], ignore_index=True)
         render_tab2(map_df, radius_km, st.session_state["resolved_lat"], st.session_state["resolved_lng"])
 
     with t3:
