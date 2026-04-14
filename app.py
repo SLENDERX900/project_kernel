@@ -273,7 +273,7 @@ def apply_filters(df_comp: pd.DataFrame):
         fee_col = None
 
     if fee_col:
-        df_comp["_fee_num"] = df_comp[fee_col].apply(extract_fee_value)
+        df_comp["_fee_num"] = df_comp[fee_col].apply(parse_fee_value)
     else:
         df_comp["_fee_num"] = 0
 
