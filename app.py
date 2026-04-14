@@ -18,6 +18,17 @@ DEFAULT_LNG = 101.5333
 MASTER_PATH = "data/master.csv"
 RAW_PATH = "data/raw.csv"
 
+
+def clean_centre_name(name: str) -> str:
+    """Remove bracketed content from centre names for cleaner display."""
+    if not isinstance(name, str):
+        return str(name)
+    # Remove content in parentheses/brackets
+    name = re.sub(r"\s*\([^)]*\)", "", name)
+    name = re.sub(r"\s*\[[^\]]*\]", "", name)
+    name = re.sub(r"\s*\{[^}]*\}", "", name)
+    return name.strip()
+
 DISPLAY_COLUMNS_MAP = {
     "centre_name": "Centre Name",
     "brand": "Brand",
@@ -440,6 +451,10 @@ def render_tab1(df_targets: pd.DataFrame, df_competitors: pd.DataFrame):
         if col not in df_competitors.columns:
             df_competitors[col] = ""
     display = pd.concat([df_targets, df_competitors], ignore_index=True)
+
+    # Clean centre names by removing bracketed content
+    if "centre_name" in display.columns:
+        display["centre_name"] = display["centre_name"].apply(clean_centre_name)
 
     cols = [c for c in ["centre_name", "brand", "address", "neighbourhood", "curriculum", "religious_orientation", "language_medium", "scale", "fee_halfday", "fee_fullday", "verification_note"] if c in display.columns]
     display = display[cols].rename(columns=DISPLAY_COLUMNS_MAP)
