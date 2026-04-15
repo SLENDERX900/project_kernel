@@ -10,6 +10,8 @@ A comprehensive Early Childhood Education (ECE) market intelligence system for S
 
 **🎉 v2.0 Update**: Now runs entirely on free tiers! Removed brittle Playwright headless browsing and expensive Google Maps API dependencies.
 
+**🌐 Live Demo**: [https://projectkernel-example.streamlit.app/](https://projectkernel-example.streamlit.app/) ⚠️ *Work in Progress – Data and features are actively being updated*
+
 ## 🎯 Features
 
 - **🔍 Multi-Source Discovery**: Overpass API, Kiddy123 Directory, Foursquare Places API
