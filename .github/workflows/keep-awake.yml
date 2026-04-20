@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Ping Streamlit App
         run: |
-          curl -s -o /dev/null -w "%{http_code}" https://project-kernel-mf5lxzim4r9j7p5ej6q8az.streamlit.app/ || echo "Ping failed"
+          curl -s -o /dev/null -w "%{http_code}" https://projectkernel-example.streamlit.app/  || echo "Ping failed"
         continue-on-error: true
 
   empty-commit:
