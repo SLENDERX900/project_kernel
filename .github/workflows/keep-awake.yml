@@ -2,29 +2,50 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    # Run every 12 hours
-    - cron: '0 */12 * * *'
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
   ping-app:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Streamlit App
+      - name: Ping Streamlit App with retries
         run: |
-          curl -s -o /dev/null -w "%{http_code}" https://projectkernel-example.streamlit.app/  || echo "Ping failed"
-        continue-on-error: true
+          MAX_RETRIES=3
+          RETRY_DELAY=30
+          APP_URL="https://projectkernel-example.streamlit.app/"
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i/$MAX_RETRIES: Pinging $APP_URL"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✓ App is awake (HTTP $HTTP_CODE)"
+              exit 0
+            else
+              echo "✗ App returned HTTP $HTTP_CODE"
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+              fi
+            fi
+          done
+          
+          echo "Failed after $MAX_RETRIES attempts"
+          exit 1
 
-  empty-commit:
+  wake-app:
     runs-on: ubuntu-latest
     needs: ping-app
+    if: always()  # Run even if ping fails to ensure app wakes up
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create empty commit
+      - name: Create empty commit to wake app
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
