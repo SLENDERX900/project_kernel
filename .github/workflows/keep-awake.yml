@@ -2,34 +2,36 @@ name: Streamlit Strict Wakeup
 
 on:
   schedule:
-    - cron: '0 */10 * * *' # Every 10 hours
-  workflow_dispatch:      # Manual trigger
-
+    - cron: '0 */10 * * *'
+  workflow_dispatch:
 jobs:
   maintenance:
     runs-on: ubuntu-latest
     permissions:
-      contents: write     # Required for the empty commit
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 0 # Fetches all history so git pull works
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          
+
       - name: Install Selenium
         run: pip install selenium webdriver-manager
-        
+
       - name: Run Wake Script
         env:
           STREAMLIT_URL: ${{ secrets.STREAMLIT_URL }}
         run: python wake_app.py
-        
+
       - name: Push Heartbeat Commit
         run: |
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@://github.com"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main # Syncs the runner with the repo first
           git commit --allow-empty -m "Heartbeat: $(date)"
-          git push
+          git push origin main
