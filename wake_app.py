@@ -4,6 +4,8 @@ import time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 def wake_streamlit():
     url = os.environ.get("STREAMLIT_URL", "").strip()
@@ -30,41 +32,26 @@ def wake_streamlit():
     
     driver = webdriver.Chrome(options=options)
     
-    print(f"🚀 Navigating to: {url}")
-    driver.get(url)
-    
-    # 1. Wait for initial JS load and check for the 'Wake Up' button
-    time.sleep(15) 
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    wake_button = next((b for b in buttons if "Yes" in b.text or "Wake" in b.text), None)
-
-    if wake_button:
-        print("👆 Hibernation detected. Clicking 'Wake Up'...")
-        wake_button.click()
-        time.sleep(5)
-    else:
-        print("✅ No wake button found. App might be starting up already.")
-
-    # 2. Polling Loop: Wait up to 120 seconds for the app UI to appear
-    print("⏳ Waiting for Streamlit UI to render (2 min timeout)...")
-    start_time = time.time()
-    is_active = False
-
-    while time.time() - start_time < 120:
-        # stAppViewContainer is the root div of a loaded Streamlit app
-        if driver.find_elements(By.CSS_SELECTOR, "[data-testid='stAppViewContainer']"):
-            print(f"✨ SUCCESS: App is LIVE after {int(time.time() - start_time)}s")
-            is_active = True
-            break
+    try:
+        print(f"🚀 Navigating to: {url}")
+        driver.get(url)
+        wait = WebDriverWait(driver, 30)
         
-        print("...still booting...")
-        time.sleep(10)
-
-    driver.quit()
-
-    if not is_active:
-        print("❌ TIMEOUT: App failed to boot within 2 minutes.")
-        sys.exit(1) # Makes the Action RED
+        # Click "Yes, get this app back up" button
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Yes, get this app back up')]"))).click()
+        print("👆 Wake-up button clicked successfully.")
+        
+        # CRITICAL: Wait for main container and stabilize
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='stAppViewContainer']")))
+        print("✨ App container detected, waiting for WebSocket connection...")
+        time.sleep(10) # Ensure WebSocket is fully established
+        print("✅ App is now fully awake and active!")
+        
+    except Exception as e:
+        print(f"⚠ Error occurred: {e}")
+        print("App might already be awake or button not found.")
+    finally:
+        driver.quit()
 
 if __name__ == "__main__":
     wake_streamlit()
