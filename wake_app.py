@@ -8,17 +8,14 @@ from selenium.webdriver.common.by import By
 def wake_streamlit():
     url = os.environ.get("STREAMLIT_URL", "").strip()
     
+    # 1. Check if empty
     if not url:
         print("❌ CRITICAL: STREAMLIT_URL is NOT detected in environment variables!")
-        return # This will help identify if the secret isn't passing through
+        print("Please set STREAMLIT_URL in GitHub Secrets with your app URL (e.g., https://your-app.streamlit.app)")
+        sys.exit(1)
     
     # Print the first 10 characters to verify it's working without exposing the whole URL
     print(f"🔗 URL detected (masked): {url[:10]}...")
-    
-    # 1. Check if empty
-    if not url:
-        print("ERROR: STREAMLIT_URL is empty! Check your GitHub Secrets.")
-        sys.exit(1)
         
     # 2. Fix missing protocol
     if not url.startswith("http"):
