@@ -1,33 +1,35 @@
-name: Keep Streamlit Awake
+name: Streamlit Strict Wakeup
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours
-  workflow_dispatch:      # Allows manual trigger
+    - cron: '0 */10 * * *' # Every 10 hours
+  workflow_dispatch:      # Manual trigger
 
 jobs:
-  wake-up:
+  maintenance:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # Required for the empty commit
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-        
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           
-      - name: Install dependencies
+      - name: Install Selenium
         run: pip install selenium webdriver-manager
         
-      - name: Run wake script
+      - name: Run Wake Script
         env:
           STREAMLIT_URL: ${{ secrets.STREAMLIT_URL }}
         run: python wake_app.py
         
-      - name: Push empty commit
+      - name: Push Heartbeat Commit
         run: |
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "Keep-alive heart-beat"
+          git config --global user.email "github-actions[bot]@://github.com"
+          git commit --allow-empty -m "Heartbeat: $(date)"
           git push
