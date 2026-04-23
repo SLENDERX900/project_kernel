@@ -31,5 +31,5 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "Heartbeat: $(date)"
+          git commit --allow-empty -m "Keep-alive heart-beat: $(date)"
           git push origin main --force
